@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from gateway.config import PlatformConfig
@@ -621,3 +622,113 @@ class TestWeixinMediaBuilder:
         adapter = _make_adapter()
         media_type, builder = adapter._outbound_media_builder("recording.silk")
         assert media_type == weixin.MEDIA_VOICE
+
+
+class TestWeixinSendImageFileParameterName:
+    """Regression test for send_image_file parameter name mismatch.
+
+    The gateway calls send_image_file(chat_id=..., image_path=...) but the
+    WeixinAdapter previously used 'path' as the parameter name, causing
+    image sending to fail. This test ensures the interface stays correct.
+    """
+
+    @patch.object(WeixinAdapter, "send_document", new_callable=AsyncMock)
+    def test_send_image_file_uses_image_path_parameter(self, send_document_mock):
+        """Verify send_image_file accepts image_path and forwards to send_document."""
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._token = "test-token"
+
+        send_document_mock.return_value = weixin.SendResult(success=True, message_id="test-id")
+
+        # This is the call pattern used by gateway/run.py extract_media
+        result = asyncio.run(
+            adapter.send_image_file(
+                chat_id="wxid_test123",
+                image_path="/tmp/test_image.png",
+                caption="Test caption",
+                metadata={"thread_id": "thread-123"},
+            )
+        )
+
+        assert result.success is True
+        send_document_mock.assert_awaited_once_with(
+            "wxid_test123",
+            file_path="/tmp/test_image.png",
+            caption="Test caption",
+            metadata={"thread_id": "thread-123"},
+        )
+
+    @patch.object(WeixinAdapter, "send_document", new_callable=AsyncMock)
+    def test_send_image_file_works_without_optional_params(self, send_document_mock):
+        """Verify send_image_file works with minimal required params."""
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._token = "test-token"
+
+        send_document_mock.return_value = weixin.SendResult(success=True, message_id="test-id")
+
+        result = asyncio.run(
+            adapter.send_image_file(
+                chat_id="wxid_test123",
+                image_path="/tmp/test_image.jpg",
+            )
+        )
+
+        assert result.success is True
+        send_document_mock.assert_awaited_once_with(
+            "wxid_test123",
+            file_path="/tmp/test_image.jpg",
+            caption="",
+            metadata=None,
+        )
+
+
+class TestWeixinVoiceSending:
+    def _connected_adapter(self) -> WeixinAdapter:
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        return adapter
+
+    @patch.object(WeixinAdapter, "_send_file", new_callable=AsyncMock)
+    @patch.object(WeixinAdapter, "_prepare_voice_payload")
+    def test_send_voice_uses_silk_payload(self, prepare_mock, send_file_mock, tmp_path):
+        adapter = self._connected_adapter()
+        source = tmp_path / "voice.ogg"
+        silk = tmp_path / "voice.silk"
+        source.write_bytes(b"ogg")
+        silk.write_bytes(b"silk")
+        prepare_mock.return_value = str(silk)
+        send_file_mock.return_value = "msg-1"
+
+        result = asyncio.run(adapter.send_voice("wxid_test123", str(source)))
+
+        assert result.success is True
+        prepare_mock.assert_called_once_with(str(source))
+        send_file_mock.assert_awaited_once_with("wxid_test123", str(silk), "")
+
+    @patch("gateway.platforms.weixin.pilk.encode")
+    @patch.object(WeixinAdapter, "_transcode_audio_to_wav")
+    def test_prepare_voice_payload_transcodes_to_silk(self, transcode_mock, pilk_encode_mock, tmp_path):
+        adapter = _make_adapter()
+        src = tmp_path / "voice.ogg"
+        src.write_bytes(b"ogg")
+        wav = tmp_path / "voice.wav"
+        wav.write_bytes(b"wav")
+        transcode_mock.return_value = str(wav)
+
+        def _fake_encode(infile, outfile, **kwargs):
+            Path(outfile).write_bytes(b"silk-bytes")
+
+        pilk_encode_mock.side_effect = _fake_encode
+
+        silk_path = adapter._prepare_voice_payload(str(src))
+
+        assert silk_path.endswith('.silk')
+        assert Path(silk_path).read_bytes() == b"silk-bytes"
+        pilk_encode_mock.assert_called_once_with(str(wav), silk_path, tencent=True)
+        assert not wav.exists()
+        os.unlink(silk_path)
