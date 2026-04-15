@@ -68,6 +68,7 @@ _MANAGED_SYSTEM_NAMES = {
     "homebrew": "Homebrew",
     "nix": "NixOS",
     "nixos": "NixOS",
+    "xiashou": "虾手",
 }
 
 
