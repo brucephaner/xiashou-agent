@@ -117,6 +117,12 @@ def format_managed_message(action: str = "modify this Hermes installation") -> s
     managed_system = get_managed_system() or "a package manager"
     raw = os.getenv("HERMES_MANAGED", "").strip().lower()
 
+    if managed_system == "虾手":
+        return (
+            "此 Hermes 由虾手桌面版管理。请从虾手应用内检查更新,"
+            "不要手动运行 `hermes update`。"
+        )
+
     if managed_system == "NixOS":
         env_hint = "true" if raw in _MANAGED_TRUE_VALUES else raw or "true"
         return (
