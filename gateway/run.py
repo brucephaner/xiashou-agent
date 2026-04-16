@@ -4035,12 +4035,16 @@ class GatewayRunner:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
+        # Append a random tip to the reset message (skip in managed mode —
+        # tips reference CLI commands that managed users shouldn't run).
+        _tip_line = ""
         try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = f"\n✦ Tip: {get_random_tip()}"
+            from hermes_cli.config import is_managed
+            if not is_managed():
+                from hermes_cli.tips import get_random_tip
+                _tip_line = f"\n✦ Tip: {get_random_tip()}"
         except Exception:
-            _tip_line = ""
+            pass
 
         if session_info:
             return f"{header}\n\n{session_info}{_tip_line}"
@@ -4185,6 +4189,12 @@ class GatewayRunner:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
             return f"⏳ 正在等待 {active_agents} 个进行中的任务完成后重启..."
+        try:
+            from hermes_cli.config import is_managed
+            if is_managed():
+                return "♻ 正在重启网关。如果 60 秒内未收到通知，请重新打开虾手应用。"
+        except Exception:
+            pass
         return "♻ 正在重启网关。如果 60 秒内未收到通知，请通过终端运行 `hermes gateway restart`。"
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
@@ -6983,7 +6993,7 @@ class GatewayRunner:
             metadata = {"thread_id": thread_id} if thread_id else None
             await adapter.send(
                 chat_id,
-                "♻ Gateway restarted successfully. Your session continues.",
+                "♻ 网关已重启完成，会话继续。",
                 metadata=metadata,
             )
             logger.info(

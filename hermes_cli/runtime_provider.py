@@ -284,9 +284,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 continue
             # Match exact name or normalized name
             name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
+            # Resolve the API key: prefer key_env (env var), fall back to
+            # inline api_key in config.yaml.
             key_env = str(entry.get("key_env", "") or "").strip()
             resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+            if not resolved_api_key:
+                resolved_api_key = str(entry.get("api_key", "") or "").strip()
 
             if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
                 # Found match by provider key

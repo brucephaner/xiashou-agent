@@ -289,8 +289,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivery_content = (
             f"定时任务回复: {task_name}\n"
             f"-------------\n\n"
-            f"{content}\n\n"
-            f"提示: 虾手无法看到这条消息，因此无法回复。"
+            f"{content}"
         )
     else:
         delivery_content = content
