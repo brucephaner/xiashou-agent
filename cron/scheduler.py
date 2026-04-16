@@ -287,10 +287,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
+            f"定时任务回复: {task_name}\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"Note: The agent cannot see this message, and therefore cannot respond to it."
+            f"提示: 虾手无法看到这条消息，因此无法回复。"
         )
     else:
         delivery_content = content

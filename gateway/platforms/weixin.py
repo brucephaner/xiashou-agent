@@ -1113,17 +1113,17 @@ class WeixinAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         if not check_weixin_requirements():
-            message = "Weixin startup failed: aiohttp and cryptography are required"
+            message = "微信服务启动失败：缺少依赖库 aiohttp / cryptography，请重装虾手"
             self._set_fatal_error("weixin_missing_dependency", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
         if not self._token:
-            message = "Weixin startup failed: WEIXIN_TOKEN is required"
+            message = "微信服务启动失败：微信凭据缺失，请回到扫码页重新登录"
             self._set_fatal_error("weixin_missing_token", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
         if not self._account_id:
-            message = "Weixin startup failed: WEIXIN_ACCOUNT_ID is required"
+            message = "微信服务启动失败：微信账号缺失，请回到扫码页重新登录"
             self._set_fatal_error("weixin_missing_account", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False

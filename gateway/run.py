@@ -1028,7 +1028,7 @@ class GatewayRunner:
         return "restart" if self._restart_requested else "shutdown"
 
     def _status_action_gerund(self) -> str:
-        return "restarting" if self._restart_requested else "shutting down"
+        return "重启中" if self._restart_requested else "关闭中"
 
     def _queue_during_drain_enabled(self) -> bool:
         return self._restart_requested and self._busy_input_mode == "queue"
@@ -1339,9 +1339,9 @@ class GatewayRunner:
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         if self._queue_during_drain_enabled():
             self._queue_or_replace_pending_event(session_key, event)
-            message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+            message = f"⏳ 网关正在{self._status_action_gerund()} — 消息已排队，恢复后自动处理。"
         else:
-            message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            message = f"⏳ 网关正在{self._status_action_gerund()}，暂时无法处理新消息。"
 
         await adapter._send_with_retry(
             chat_id=event.source.chat_id,
@@ -2550,7 +2550,7 @@ class GatewayRunner:
                 # instead of resuming the stuck context (#7536).
                 self.session_store.suspend_session(_quick_key)
                 logger.info("HARD STOP for session %s — suspended, session lock released", _quick_key[:20])
-                return "⚡ Force-stopped. The session is suspended — your next message will start fresh."
+                return "⚡ 已强制停止。会话已挂起 — 下条消息将开始新会话。"
 
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
@@ -2578,7 +2578,7 @@ class GatewayRunner:
             if event.get_command() in ("queue", "q"):
                 queued_text = event.get_command_args().strip()
                 if not queued_text:
-                    return "Usage: /queue <prompt>"
+                    return "用法: /queue <提示词>（/排队 <提示词>）"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
@@ -2589,11 +2589,11 @@ class GatewayRunner:
                         message_id=event.message_id,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
-                return "Queued for the next turn."
+                return "已排队，等待下一轮处理。"
 
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+                return "代理正在运行 — 请等待完成或先 /stop（/停止），再切换模型。"
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
@@ -2624,7 +2624,7 @@ class GatewayRunner:
                     if _quick_key in self._running_agents:
                         del self._running_agents[_quick_key]
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
-                    return "⚡ Force-stopped. The agent was still starting — session unlocked."
+                    return "⚡ 已强制停止。代理还在启动中 — 会话已解锁。"
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
@@ -2635,9 +2635,9 @@ class GatewayRunner:
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    f"⏳ 网关正在{self._status_action_gerund()} — 消息已排队，恢复后自动处理。"
                     if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    else f"⏳ 网关正在{self._status_action_gerund()}，暂时无法处理新消息。"
                 )
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
@@ -2724,7 +2724,7 @@ class GatewayRunner:
                     ),
                 )
                 if not event.text:
-                    return "Failed to load the bundled /plan skill."
+                    return "无法加载内置 /plan 技能。"
                 canonical = None
             except Exception as e:
                 logger.exception("Failed to prepare /plan command")
@@ -2785,7 +2785,7 @@ class GatewayRunner:
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return f"⏳ 网关正在{self._status_action_gerund()}，暂时无法处理新消息。"
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -2810,7 +2810,7 @@ class GatewayRunner:
                             output = (stdout or stderr).decode().strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
+                            return "快捷命令超时（30秒）。"
                         except Exception as e:
                             return f"Quick command error: {e}"
                     else:
@@ -3173,19 +3173,18 @@ class GatewayRunner:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
                         if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
+                            reason_text = "上次会话被中止"
                         elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                            reason_text = f"每日 {policy.at_hour}:00 定时重置"
                         else:
                             hours = policy.idle_minutes // 60
                             mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
+                            duration = f"{hours}小时" if not mins else f"{hours}小时{mins}分钟" if hours else f"{mins}分钟"
+                            reason_text = f"闲置 {duration}"
                         notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                            f"◐ 会话已自动重置（{reason_text}）。对话历史已清除。\n"
+                            f"使用 /resume（/恢复）浏览并恢复之前的会话。\n"
+                            f"可在 config.yaml 的 session_reset 中调整重置策略。"
                         )
                         try:
                             session_info = self._format_session_info()
@@ -3505,11 +3504,9 @@ class GatewayRunner:
                 if adapter:
                     await adapter.send(
                         source.chat_id,
-                        f"📬 No home channel is set for {platform_name.title()}. "
-                        f"A home channel is where Hermes delivers cron job results "
-                        f"and cross-platform messages.\n\n"
-                        f"Type /sethome to make this chat your home channel, "
-                        f"or ignore to skip."
+                        f"📬 {platform_name.title()} 尚未设置主频道。"
+                        f"主频道用于接收定时任务结果和跨平台消息。\n\n"
+                        f"发送 /sethome（/设主页）将当前对话设为主频道，或忽略跳过。"
                     )
         
         # -----------------------------------------------------------------
@@ -3827,13 +3824,13 @@ class GatewayRunner:
                     if _resets_in and _resets_in > 0:
                         import math
                         _hours = math.ceil(_resets_in / 3600)
-                        status_hint = f" Your plan's usage limit has been reached. It resets in ~{_hours}h."
+                        status_hint = f" 套餐用量已达上限，约 {_hours} 小时后重置。"
                     else:
-                        status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
+                        status_hint = " 套餐用量已达上限，请等待重置。"
                 else:
-                    status_hint = " You are being rate-limited. Please wait a moment and try again."
+                    status_hint = " 请求过于频繁，请稍后再试。"
             elif status_code == 529:
-                status_hint = " The API is temporarily overloaded. Please try again shortly."
+                status_hint = " API 服务暂时过载，请稍后重试。"
             elif status_code in (400, 500):
                 # 400 with a large session is context overflow.
                 # 500 with a large session often means the payload is too large
@@ -3911,7 +3908,7 @@ class GatewayRunner:
         if config_context_length is not None:
             ctx_source = "config"
         elif context_length == DEFAULT_FALLBACK_CONTEXT:
-            ctx_source = "default — set model.context_length in config to override"
+            ctx_source = "默认值 — 可在 config 中设置 model.context_length 覆盖"
         else:
             ctx_source = "detected"
 
@@ -3923,15 +3920,19 @@ class GatewayRunner:
         else:
             ctx_display = str(context_length)
 
+        _ctx_source_zh = {
+            "config": "配置指定",
+            "detected": "自动检测",
+        }.get(ctx_source, ctx_source)
         lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
+            f"◆ 模型: `{model}`",
+            f"◆ 供应商: {provider or 'openrouter'}",
+            f"◆ 上下文: {ctx_display} tokens（{_ctx_source_zh}）",
         ]
 
         # Show endpoint for local/custom setups
         if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
-            lines.append(f"◆ Endpoint: {base_url}")
+            lines.append(f"◆ 端点: {base_url}")
 
         return "\n".join(lines)
 
@@ -4019,11 +4020,11 @@ class GatewayRunner:
             session_info = ""
 
         if new_entry:
-            header = "✨ Session reset! Starting fresh."
+            header = "✨ 会话已重置！开始新对话。"
         else:
             # No existing session, just create one
             new_entry = self.session_store.get_or_create_session(source, force_new=True)
-            header = "✨ New session started!"
+            header = "✨ 新会话已开始！"
 
         # Fire plugin on_session_reset hook (new session guaranteed to exist)
         try:
@@ -4135,7 +4136,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             self.session_store.suspend_session(session_key)
             logger.info("HARD STOP (pending) for session %s — suspended, sentinel cleared", session_key[:20])
-            return "⚡ Force-stopped. The agent was still starting — your next message will start fresh."
+            return "⚡ 已强制停止。代理还在启动中 — 下条消息将开始新会话。"
         if agent:
             agent.interrupt("Stop requested")
             # Force-clean the session lock so a truly hung agent doesn't
@@ -4143,17 +4144,17 @@ class GatewayRunner:
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
             self.session_store.suspend_session(session_key)
-            return "⚡ Force-stopped. Your next message will start a fresh session."
+            return "⚡ 已强制停止。下条消息将开始新会话。"
         else:
-            return "No active task to stop."
+            return "没有正在运行的任务。"
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
         """Handle /restart command - drain active work, then restart the gateway."""
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             if count:
-                return f"⏳ Draining {count} active agent(s) before restart..."
-            return "⏳ Gateway restart already in progress..."
+                return f"⏳ 正在等待 {count} 个进行中的任务完成后重启..."
+            return "⏳ 网关重启已在进行中..."
 
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
@@ -4183,14 +4184,14 @@ class GatewayRunner:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return f"⏳ Draining {active_agents} active agent(s) before restart..."
-        return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+            return f"⏳ 正在等待 {active_agents} 个进行中的任务完成后重启..."
+        return "♻ 正在重启网关。如果 60 秒内未收到通知，请通过终端运行 `hermes gateway restart`。"
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from hermes_cli.commands import gateway_help_lines
         lines = [
-            "📖 **Hermes Commands**\n",
+            "📖 **命令列表**\n",
             *gateway_help_lines(),
         ]
         try:
@@ -4217,7 +4218,7 @@ class GatewayRunner:
             try:
                 requested_page = int(raw_args)
             except ValueError:
-                return "Usage: `/commands [page]`"
+                return "用法: `/commands [页码]`（/命令 [页码]）"
         else:
             requested_page = 1
 
@@ -4236,7 +4237,7 @@ class GatewayRunner:
             pass
 
         if not entries:
-            return "No commands available."
+            return "没有可用的命令。"
 
         from gateway.config import Platform
         page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
@@ -4665,18 +4666,18 @@ class GatewayRunner:
             personalities = {}
 
         if not personalities:
-            return "No personalities configured in `~/.hermes/config.yaml`"
+            return "未在 `~/.hermes/config.yaml` 中配置人设。"
 
         if not args:
-            lines = ["🎭 **Available Personalities**\n"]
-            lines.append("• `none` — (no personality overlay)")
+            lines = ["🎭 **可用人设**\n"]
+            lines.append("• `none` — （无人设叠加）")
             for name, prompt in personalities.items():
                 if isinstance(prompt, dict):
                     preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
                 else:
                     preview = prompt[:50] + "..." if len(prompt) > 50 else prompt
                 lines.append(f"• `{name}` — {preview}")
-            lines.append("\nUsage: `/personality <name>`")
+            lines.append("\n用法: `/personality <名称>`（/人设 <名称>）")
             return "\n".join(lines)
 
         def _resolve_prompt(value):
@@ -4698,7 +4699,7 @@ class GatewayRunner:
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
             self._ephemeral_system_prompt = ""
-            return "🎭 Personality cleared — using base agent behavior.\n_(takes effect on next message)_"
+            return "🎭 人设已清除 — 使用默认行为。\n_(下条消息生效)_"
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
 
@@ -4714,10 +4715,10 @@ class GatewayRunner:
             # Update in-memory so it takes effect on the very next message.
             self._ephemeral_system_prompt = new_prompt
 
-            return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
+            return f"🎭 人设已设为 **{args}**\n_(下条消息生效)_"
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
-        return f"Unknown personality: `{args}`\n\nAvailable: {available}"
+        return f"未知人设: `{args}`\n\n可用: {available}"
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
@@ -4735,7 +4736,7 @@ class GatewayRunner:
                 break
         
         if not last_user_msg:
-            return "No previous message to retry."
+            return "没有可重试的消息。"
         
         # Truncate history to before the last user message and persist
         truncated = history[:last_user_idx]
@@ -4768,7 +4769,7 @@ class GatewayRunner:
                 break
         
         if last_user_idx is None:
-            return "Nothing to undo."
+            return "没有可撤回的消息。"
         
         removed_msg = history[last_user_idx].get("content", "")
         removed_count = len(history) - last_user_idx
@@ -4777,7 +4778,7 @@ class GatewayRunner:
         session_entry.last_prompt_tokens = 0
         
         preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
-        return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
+        return f"↩️ 已撤回 {removed_count} 条消息。\n移除: \"{preview}\""
     
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
@@ -4801,11 +4802,11 @@ class GatewayRunner:
             # Also set in the current environment so it takes effect immediately
             os.environ[env_key] = str(chat_id)
         except Exception as e:
-            return f"Failed to save home channel: {e}"
-        
+            return f"保存主频道失败: {e}"
+
         return (
-            f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
-            f"Cron jobs and cross-platform messages will be delivered here."
+            f"✅ 主频道已设为 **{chat_name}**（ID: {chat_id}）。\n"
+            f"定时任务结果和跨平台消息将发送到这里。"
         )
     
     @staticmethod
@@ -4844,7 +4845,7 @@ class GatewayRunner:
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-            return "Voice mode disabled. Text-only replies."
+            return "语音模式已关闭，仅文字回复。"
         elif args == "tts":
             self._voice_mode[chat_id] = "all"
             self._save_voice_modes()
@@ -4889,29 +4890,29 @@ class GatewayRunner:
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
-                return "Voice mode enabled."
+                return "语音模式已开启。"
             else:
                 self._voice_mode[chat_id] = "off"
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-                return "Voice mode disabled."
+                return "语音模式已关闭。"
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self.adapters.get(event.source.platform)
         if not hasattr(adapter, "join_voice_channel"):
-            return "Voice channels are not supported on this platform."
+            return "此平台不支持语音频道。"
 
         guild_id = self._get_guild_id(event)
         if not guild_id:
-            return "This command only works in a Discord server."
+            return "此命令仅在 Discord 服务器中可用。"
 
         voice_channel = await adapter.get_user_voice_channel(
             guild_id, event.source.user_id
         )
         if not voice_channel:
-            return "You need to be in a voice channel first."
+            return "请先加入一个语音频道。"
 
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
@@ -4947,7 +4948,7 @@ class GatewayRunner:
             )
         # Join failed — clear callback
         adapter._voice_input_callback = None
-        return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
+        return "加入语音频道失败，请检查机器人权限（Connect + Speak）。"
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         """Leave the Discord voice channel."""
@@ -4955,10 +4956,10 @@ class GatewayRunner:
         guild_id = self._get_guild_id(event)
 
         if not guild_id or not hasattr(adapter, "leave_voice_channel"):
-            return "Not in a voice channel."
+            return "未在语音频道中。"
 
         if not hasattr(adapter, "is_in_voice_channel") or not adapter.is_in_voice_channel(guild_id):
-            return "Not in a voice channel."
+            return "未在语音频道中。"
 
         try:
             await adapter.leave_voice_channel(guild_id)
@@ -4970,7 +4971,7 @@ class GatewayRunner:
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
-        return "Left voice channel."
+        return "已离开语音频道。"
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
         """Called by the adapter when a voice channel times out.
@@ -5298,10 +5299,9 @@ class GatewayRunner:
         prompt = event.get_command_args().strip()
         if not prompt:
             return (
-                "Usage: /background <prompt>\n"
-                "Example: /background Summarize the top HN stories today\n\n"
-                "Runs the prompt in a separate session. "
-                "You can keep chatting — the result will appear here when done."
+                "用法: /background <提示词>（/后台 <提示词>）\n"
+                "示例: /后台 总结今天的热门新闻\n\n"
+                "在独立会话中运行任务，你可以继续对话，完成后结果会自动推送。"
             )
 
         source = event.source
@@ -5315,7 +5315,7 @@ class GatewayRunner:
         _task.add_done_callback(self._background_tasks.discard)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-        return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
+        return f'🔄 后台任务已启动: "{preview}"\n任务 ID: {task_id}\n你可以继续对话，完成后结果会自动推送。'
 
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
@@ -5339,7 +5339,7 @@ class GatewayRunner:
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    f"❌ 后台任务 {task_id} 失败: 未配置 AI 服务凭证。",
                     metadata=_thread_metadata,
                 )
                 return
@@ -5398,7 +5398,7 @@ class GatewayRunner:
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = f'✅ 后台任务完成\n任务: "{preview}"\n\n'
 
                 if text_content:
                     await adapter.send(
@@ -5409,7 +5409,7 @@ class GatewayRunner:
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=header + "（未生成回复）",
                         metadata=_thread_metadata,
                     )
 
@@ -5437,7 +5437,7 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=f'✅ 后台任务完成\n任务: "{preview}"\n\n（未生成回复）',
                     metadata=_thread_metadata,
                 )
 
@@ -5446,7 +5446,7 @@ class GatewayRunner:
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
+                    content=f"❌ 后台任务 {task_id} 失败: {e}",
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -5457,9 +5457,9 @@ class GatewayRunner:
         question = event.get_command_args().strip()
         if not question:
             return (
-                "Usage: /btw <question>\n"
-                "Example: /btw what module owns session title sanitization?\n\n"
-                "Answers using session context. No tools, not persisted."
+                "用法: /btw <问题>（/顺便 <问题>）\n"
+                "示例: /顺便 这个功能是哪个模块负责的？\n\n"
+                "使用当前会话上下文回答，不调用工具，不记入历史。"
             )
 
         source = event.source
@@ -5468,7 +5468,7 @@ class GatewayRunner:
         # Guard: one /btw at a time per session
         existing = getattr(self, "_active_btw_tasks", {}).get(session_key)
         if existing and not existing.done():
-            return "A /btw is already running for this chat. Wait for it to finish."
+            return "/btw（/顺便）正在处理中，请等待完成。"
 
         if not hasattr(self, "_active_btw_tasks"):
             self._active_btw_tasks: dict = {}
@@ -5575,7 +5575,7 @@ class GatewayRunner:
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
             if not response:
-                response = "(No response generated)"
+                response = "（未生成回复）"
 
             media_files, response = adapter.extract_media(response)
             images, text_content = adapter.extract_images(response)
@@ -5591,7 +5591,7 @@ class GatewayRunner:
             elif not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=header + "(No response generated)",
+                    content=header + "（未生成回复）",
                     metadata=_thread_meta,
                 )
 
@@ -5654,22 +5654,30 @@ class GatewayRunner:
                 logger.error("Failed to save config key %s: %s", key_path, e)
                 return False
 
+        # Chinese argument aliases
+        _ZH_EFFORT_MAP = {"无": "none", "低": "low", "中": "medium", "高": "high"}
+        _ZH_DISPLAY_MAP = {"显示": "show", "开": "on", "隐藏": "hide", "关": "off"}
+
         if not args:
             # Show current state
             rc = self._reasoning_config
             if rc is None:
-                level = "medium (default)"
+                level = "medium（默认）"
             elif rc.get("enabled") is False:
-                level = "none (disabled)"
+                level = "none（已禁用）"
             else:
                 level = rc.get("effort", "medium")
             display_state = "on ✓" if self._show_reasoning else "off"
             return (
-                "🧠 **Reasoning Settings**\n\n"
-                f"**Effort:** `{level}`\n"
-                f"**Display:** {display_state}\n\n"
-                "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|show|hide>`"
+                "🧠 **推理设置**\n\n"
+                f"**强度:** `{level}`\n"
+                f"**显示:** {display_state}\n\n"
+                "_用法:_ `/reasoning <none|minimal|low|medium|high|xhigh|show|hide>`\n"
+                "_中文:_ `/推理 <无|低|中|高|显示|隐藏>`"
             )
+
+        # Resolve Chinese aliases to English tokens
+        args = _ZH_DISPLAY_MAP.get(args, _ZH_EFFORT_MAP.get(args, args))
 
         # Display toggle (per-platform)
         platform_key = _platform_config_key(event.source.platform)
@@ -5677,14 +5685,14 @@ class GatewayRunner:
             self._show_reasoning = True
             _save_config_key(f"display.platforms.{platform_key}.show_reasoning", True)
             return (
-                "🧠 ✓ Reasoning display: **ON**\n"
-                f"Model thinking will be shown before each response on **{platform_key}**."
+                "🧠 ✓ 推理显示: **ON（开启）**\n"
+                f"模型思维过程将在 **{platform_key}** 的回复前显示。"
             )
 
         if args in ("hide", "off"):
             self._show_reasoning = False
             _save_config_key(f"display.platforms.{platform_key}.show_reasoning", False)
-            return f"🧠 ✓ Reasoning display: **OFF** for **{platform_key}**"
+            return f"🧠 ✓ 推理显示: **OFF（关闭）**，平台: **{platform_key}**"
 
         # Effort level change
         effort = args.strip()
@@ -5694,16 +5702,17 @@ class GatewayRunner:
             parsed = {"enabled": True, "effort": effort}
         else:
             return (
-                f"⚠️ Unknown argument: `{effort}`\n\n"
-                "**Valid levels:** none, minimal, low, medium, high, xhigh\n"
-                "**Display:** show, hide"
+                f"⚠️ 未知参数: `{effort}`\n\n"
+                "**可用强度:** none, minimal, low, medium, high, xhigh\n"
+                "**中文快捷:** 无, 低, 中, 高\n"
+                "**显示开关:** show, hide（显示, 隐藏）"
             )
 
         self._reasoning_config = parsed
         if _save_config_key("agent.reasoning_effort", effort):
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
+            return f"🧠 ✓ 推理强度已设为 `{effort}`（已保存到配置）\n_(下条消息生效)_"
         else:
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
+            return f"🧠 ✓ 推理强度已设为 `{effort}`（仅本次会话）"
 
     async def _handle_fast_command(self, event: MessageEvent) -> str:
         """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
@@ -5717,7 +5726,7 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         model = _resolve_gateway_model(user_config)
         if not model_supports_fast_mode(model):
-            return "⚡ /fast is only available for OpenAI models that support Priority Processing."
+            return "⚡ /fast 仅适用于支持 Priority Processing 的 OpenAI 模型。"
 
         def _save_config_key(key_path: str, value):
             """Save a dot-separated key to config.yaml."""
@@ -5739,31 +5748,36 @@ class GatewayRunner:
                 logger.error("Failed to save config key %s: %s", key_path, e)
                 return False
 
+        # Chinese argument aliases
+        _ZH_FAST_MAP = {"快速": "fast", "普通": "normal", "状态": "status", "开": "on", "关": "off"}
+        if args:
+            args = _ZH_FAST_MAP.get(args, args)
+
         if not args or args == "status":
             status = "fast" if self._service_tier == "priority" else "normal"
             return (
-                "⚡ Priority Processing\n\n"
-                f"Current mode: `{status}`\n\n"
-                "_Usage:_ `/fast <normal|fast|status>`"
+                "⚡ 优先处理模式\n\n"
+                f"当前模式: `{status}`\n\n"
+                "_用法:_ `/fast <normal|fast|status>`（/快速 <普通|快速|状态>）"
             )
 
         if args in {"fast", "on"}:
             self._service_tier = "priority"
             saved_value = "fast"
-            label = "FAST"
+            label = "FAST（快速）"
         elif args in {"normal", "off"}:
             self._service_tier = None
             saved_value = "normal"
-            label = "NORMAL"
+            label = "NORMAL（普通）"
         else:
             return (
-                f"⚠️ Unknown argument: `{args}`\n\n"
-                "**Valid options:** normal, fast, status"
+                f"⚠️ 未知参数: `{args}`\n\n"
+                "**可用选项:** normal, fast, status（普通, 快速, 状态）"
             )
 
         if _save_config_key("agent.service_tier", saved_value):
-            return f"⚡ ✓ Priority Processing: **{label}** (saved to config)\n_(takes effect on next message)_"
-        return f"⚡ ✓ Priority Processing: **{label}** (this session only)"
+            return f"⚡ ✓ 优先处理: **{label}**（已保存到配置）\n_(下条消息生效)_"
+        return f"⚡ ✓ 优先处理: **{label}**（仅本次会话）"
 
     async def _handle_yolo_command(self, event: MessageEvent) -> str:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
@@ -5774,13 +5788,24 @@ class GatewayRunner:
         )
 
         session_key = self._session_key_for_source(event.source)
-        current = is_session_yolo_enabled(session_key)
-        if current:
-            disable_session_yolo(session_key)
-            return "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
-        else:
+        args = event.get_command_args().strip().lower()
+        _ZH_TOGGLE = {"开": "on", "关": "off"}
+        args = _ZH_TOGGLE.get(args, args)
+
+        if args == "on":
             enable_session_yolo(session_key)
-            return "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
+            return "⚡ YOLO 模式 **ON（开启）** — 本次会话所有命令自动批准，请谨慎使用。"
+        elif args == "off":
+            disable_session_yolo(session_key)
+            return "⚠️ YOLO 模式 **OFF（关闭）** — 本次会话危险命令需手动批准。"
+        else:
+            current = is_session_yolo_enabled(session_key)
+            if current:
+                disable_session_yolo(session_key)
+                return "⚠️ YOLO 模式 **OFF（关闭）** — 本次会话危险命令需手动批准。"
+            else:
+                enable_session_yolo(session_key)
+                return "⚡ YOLO 模式 **ON（开启）** — 本次会话所有命令自动批准，请谨慎使用。"
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.
@@ -5808,18 +5833,18 @@ class GatewayRunner:
 
         if not gate_enabled:
             return (
-                "The `/verbose` command is not enabled for messaging platforms.\n\n"
-                "Enable it in `config.yaml`:\n```yaml\n"
+                "`/verbose`（/详细）命令在消息平台上未启用。\n\n"
+                "在 `config.yaml` 中启用:\n```yaml\n"
                 "display:\n  tool_progress_command: true\n```"
             )
 
         # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose"]
         descriptions = {
-            "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
-            "new": "⚙️ Tool progress: **NEW** — shown when tool changes (preview length: `display.tool_preview_length`, default 40).",
-            "all": "⚙️ Tool progress: **ALL** — every tool call shown (preview length: `display.tool_preview_length`, default 40).",
-            "verbose": "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments.",
+            "off": "⚙️ 工具进度: **OFF（关闭）** — 不显示工具活动。",
+            "new": "⚙️ 工具进度: **NEW（仅新工具）** — 工具变化时显示（预览长度: `display.tool_preview_length`，默认 40）。",
+            "all": "⚙️ 工具进度: **ALL（全部）** — 显示每次工具调用（预览长度: `display.tool_preview_length`，默认 40）。",
+            "verbose": "⚙️ 工具进度: **VERBOSE（详细）** — 显示每次工具调用及完整参数。",
         }
 
         # Read current effective mode for this platform via the resolver
@@ -5861,7 +5886,7 @@ class GatewayRunner:
         history = self.session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
-            return "Not enough conversation to compress (need at least 4 messages)."
+            return "对话内容不足，无法压缩（至少需要 4 条消息）。"
 
         # Extract optional focus topic from command args
         focus_topic = (event.get_command_args() or "").strip() or None
@@ -5877,7 +5902,7 @@ class GatewayRunner:
                 session_key=session_key,
             )
             if not runtime_kwargs.get("api_key"):
-                return "No provider configured -- cannot compress."
+                return "未配置 AI 服务 — 无法压缩。"
 
             msgs = [
                 {"role": m.get("role"), "content": m.get("content")}
@@ -5902,7 +5927,7 @@ class GatewayRunner:
             compress_start = compressor._align_boundary_forward(msgs, compress_start)
             compress_end = compressor._find_tail_cut_by_tokens(msgs, compress_start)
             if compress_start >= compress_end:
-                return "Nothing to compress yet (the transcript is still all protected context)."
+                return "暂无可压缩内容（对话记录仍在受保护的上下文中）。"
 
             loop = asyncio.get_event_loop()
             compressed, _ = await loop.run_in_executor(
@@ -5949,7 +5974,7 @@ class GatewayRunner:
         session_id = session_entry.session_id
 
         if not self._session_db:
-            return "Session database not available."
+            return "会话数据库不可用。"
 
         # Ensure session exists in SQLite DB (it may only exist in session_store
         # if this is the first command in a new session)
@@ -5973,27 +5998,27 @@ class GatewayRunner:
             except ValueError as e:
                 return f"⚠️ {e}"
             if not sanitized:
-                return "⚠️ Title is empty after cleanup. Please use printable characters."
+                return "⚠️ 清理后标题为空，请使用可打印字符。"
             # Set the title
             try:
                 if self._session_db.set_session_title(session_id, sanitized):
-                    return f"✏️ Session title set: **{sanitized}**"
+                    return f"✏️ 会话标题已设为: **{sanitized}**"
                 else:
-                    return "Session not found in database."
+                    return "会话未在数据库中找到。"
             except ValueError as e:
                 return f"⚠️ {e}"
         else:
             # Show the current title and session ID
             title = self._session_db.get_session_title(session_id)
             if title:
-                return f"📌 Session: `{session_id}`\nTitle: **{title}**"
+                return f"📌 会话: `{session_id}`\n标题: **{title}**"
             else:
-                return f"📌 Session: `{session_id}`\nNo title set. Usage: `/title My Session Name`"
+                return f"📌 会话: `{session_id}`\n未设置标题。用法: `/title 我的会话名`（/标题 我的会话名）"
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — switch to a previously-named session."""
         if not self._session_db:
-            return "Session database not available."
+            return "会话数据库不可用。"
 
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -6009,34 +6034,34 @@ class GatewayRunner:
                 titled = [s for s in sessions if s.get("title")]
                 if not titled:
                     return (
-                        "No named sessions found.\n"
-                        "Use `/title My Session` to name your current session, "
-                        "then `/resume My Session` to return to it later."
+                        "没有已命名的会话。\n"
+                        "使用 `/title 我的会话`（/标题）为当前会话命名，"
+                        "然后用 `/resume 我的会话`（/恢复）切换回来。"
                     )
-                lines = ["📋 **Named Sessions**\n"]
+                lines = ["📋 **已命名的会话**\n"]
                 for s in titled[:10]:
                     title = s["title"]
                     preview = s.get("preview", "")[:40]
                     preview_part = f" — _{preview}_" if preview else ""
                     lines.append(f"• **{title}**{preview_part}")
-                lines.append("\nUsage: `/resume <session name>`")
+                lines.append("\n用法: `/resume <会话名>`（/恢复 <会话名>）")
                 return "\n".join(lines)
             except Exception as e:
                 logger.debug("Failed to list titled sessions: %s", e)
-                return f"Could not list sessions: {e}"
+                return f"无法列出会话: {e}"
 
         # Resolve the name to a session ID
         target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return (
-                f"No session found matching '**{name}**'.\n"
-                "Use `/resume` with no arguments to see available sessions."
+                f"未找到匹配 '**{name}**' 的会话。\n"
+                "使用 `/resume`（/恢复）不带参数可查看可用会话。"
             )
 
         # Check if already on that session
         current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return f"📌 Already on session **{name}**."
+            return f"📌 当前已在会话 **{name}** 中。"
 
         # Flush memories for current session before switching
         try:
@@ -6055,7 +6080,7 @@ class GatewayRunner:
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
         if not new_entry:
-            return "Failed to switch session."
+            return "切换会话失败。"
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
@@ -6063,9 +6088,9 @@ class GatewayRunner:
         # Count messages for context
         history = self.session_store.load_transcript(target_id)
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
-        msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
+        msg_part = f"（{msg_count} 条消息）" if msg_count else ""
 
-        return f"↻ Resumed session **{title}**{msg_part}. Conversation restored."
+        return f"↻ 已恢复会话 **{title}**{msg_part}。对话已还原。"
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
         """Handle /branch [name] — fork the current session into a new independent copy.
@@ -6077,7 +6102,7 @@ class GatewayRunner:
         import uuid as _uuid
 
         if not self._session_db:
-            return "Session database not available."
+            return "会话数据库不可用。"
 
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -6086,7 +6111,7 @@ class GatewayRunner:
         current_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(current_entry.session_id)
         if not history:
-            return "No conversation to branch — send a message first."
+            return "没有可分支的对话 — 请先发送一条消息。"
 
         branch_name = event.get_command_args().strip()
 
@@ -6117,7 +6142,7 @@ class GatewayRunner:
             )
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)
-            return f"Failed to create branch: {e}"
+            return f"创建分支失败: {e}"
 
         # Copy conversation history to the new session
         for msg in history:
@@ -6143,18 +6168,18 @@ class GatewayRunner:
         # Switch the session store entry to the new session
         new_entry = self.session_store.switch_session(session_key, new_session_id)
         if not new_entry:
-            return "Branch created but failed to switch to it."
+            return "分支已创建但切换失败。"
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         return (
-            f"⑂ Branched to **{branch_title}**"
-            f" ({msg_count} message{'s' if msg_count != 1 else ''} copied)\n"
-            f"Original: `{parent_session_id}`\n"
-            f"Branch: `{new_session_id}`\n"
-            f"Use `/resume` to switch back to the original."
+            f"⑂ 已分支到 **{branch_title}**"
+            f"（已复制 {msg_count} 条消息）\n"
+            f"原会话: `{parent_session_id}`\n"
+            f"分支: `{new_session_id}`\n"
+            f"使用 `/resume`（/恢复）切换回原会话。"
         )
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
@@ -6250,7 +6275,7 @@ class GatewayRunner:
                 f"Estimated context: ~{approx:,} tokens\n"
                 f"_(Detailed usage available after the first agent response)_"
             )
-        return "No usage data available for this session."
+        return "本次会话暂无用量数据。"
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
@@ -6364,7 +6389,7 @@ class GatewayRunner:
 
         except Exception as e:
             logger.warning("MCP reload failed: %s", e)
-            return f"❌ MCP reload failed: {e}"
+            return f"❌ MCP 重载失败: {e}"
 
     # ------------------------------------------------------------------
     # /approve & /deny — explicit dangerous-command approval
@@ -6402,36 +6427,37 @@ class GatewayRunner:
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
-                return "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
-            return "No pending command to approve."
+                return "⚠️ 授权已过期（代理不再等待），请让代理重试。"
+            return "没有待批准的命令。"
 
         # Parse args: support "all", "all session", "all always", "session", "always"
+        # Chinese aliases: 全部=all, 永久=always, 本次=session
         args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
+        resolve_all = any(a in ("all", "全部") for a in args)
+        remaining = [a for a in args if a not in ("all", "全部")]
 
-        if any(a in ("always", "permanent", "permanently") for a in remaining):
+        if any(a in ("always", "permanent", "permanently", "永久") for a in remaining):
             choice = "always"
-            scope_msg = " (pattern approved permanently)"
-        elif any(a in ("session", "ses") for a in remaining):
+            scope_msg = "（此类操作已永久批准）"
+        elif any(a in ("session", "ses", "本次") for a in remaining):
             choice = "session"
-            scope_msg = " (pattern approved for this session)"
+            scope_msg = "（此类操作已为本次会话批准）"
         else:
             choice = "once"
             scope_msg = ""
 
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
         if not count:
-            return "No pending command to approve."
+            return "没有待批准的命令。"
 
         # Resume typing indicator — agent is about to continue processing.
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        count_msg = f" ({count} commands)" if count > 1 else ""
+        count_msg = f"（共 {count} 条命令）" if count > 1 else ""
         logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
-        return f"✅ Command{'s' if count > 1 else ''} approved{scope_msg}{count_msg}. The agent is resuming..."
+        return f"✅ 命令已批准{scope_msg}{count_msg}，代理正在恢复执行..."
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny command — reject pending dangerous command(s).
@@ -6451,24 +6477,24 @@ class GatewayRunner:
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
-                return "❌ Command denied (approval was stale)."
-            return "No pending command to deny."
+                return "❌ 命令已拒绝（授权已过期）。"
+            return "没有待拒绝的命令。"
 
         args = event.get_command_args().strip().lower()
-        resolve_all = "all" in args
+        resolve_all = "all" in args or "全部" in args
 
         count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
         if not count:
-            return "No pending command to deny."
+            return "没有待拒绝的命令。"
 
         # Resume typing indicator — agent continues (with BLOCKED result).
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        count_msg = f" ({count} commands)" if count > 1 else ""
+        count_msg = f"（共 {count} 条命令）" if count > 1 else ""
         logger.info("User denied %d dangerous command(s) via /deny", count)
-        return f"❌ Command{'s' if count > 1 else ''} denied{count_msg}."
+        return f"❌ 命令已拒绝{count_msg}。"
 
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
@@ -6560,7 +6586,7 @@ class GatewayRunner:
         git_dir = project_root / '.git'
 
         if not git_dir.exists():
-            return "✗ Not a git repository — cannot update."
+            return "✗ 不是 git 仓库 — 无法更新。"
 
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
@@ -6622,10 +6648,10 @@ class GatewayRunner:
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
-            return f"✗ Failed to start update: {e}"
+            return f"✗ 更新启动失败: {e}"
 
         self._schedule_update_notification_watch()
-        return "⚕ Starting Hermes update… I'll stream progress here."
+        return "⚕ 正在启动更新… 进度将在此处显示。"
 
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
@@ -6830,7 +6856,7 @@ class GatewayRunner:
             exit_code_path.write_text("124")
             await _flush_buffer()
             try:
-                await adapter.send(chat_id, "❌ Hermes update timed out after 30 minutes.")
+                await adapter.send(chat_id, "❌ 更新超时（已等待 30 分钟）。")
             except Exception:
                 pass
             for p in (pending_path, claimed_path, output_path,
@@ -8068,11 +8094,13 @@ class GatewayRunner:
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
                 msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
+                    f"⚠️ **危险命令需要授权：**\n"
                     f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+                    f"原因: {desc}\n\n"
+                    f"回复 `/approve`（/批准）执行，"
+                    f"`/approve session`（/批准 本次）为本次会话批准此类操作，"
+                    f"`/approve always`（/批准 永久）永久批准此类操作，"
+                    f"或 `/deny`（/拒绝）取消。"
                 )
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -8121,7 +8149,7 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                error_msg = f"⚠️ {result['error']}" if result.get("error") else "（未生成回复）"
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -8488,7 +8516,7 @@ class GatewayRunner:
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt("Execution timed out (inactivity)")
+                    _timed_out_agent.interrupt("执行超时（长时间无响应）")
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
