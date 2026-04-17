@@ -8391,7 +8391,7 @@ class AIAgent:
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
                         if self._fallback_index < len(self._fallback_chain):
-                            self._emit_status("⚠️ Empty/malformed response — switching to fallback...")
+                            self._emit_status("⚠️ 返回内容为空或无效 — 正在切换备用线路…")
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
@@ -8461,13 +8461,13 @@ class AIAgent:
                         
                         if retry_count >= max_retries:
                             # Try fallback before giving up
-                            self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                            self._emit_status(f"⚠️ 无效响应，已重试 {max_retries} 次 — 正在尝试备用线路…")
                             if self._try_activate_fallback():
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
                                 continue
-                            self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                            self._emit_status(f"❌ 无效响应，已重试 {max_retries} 次，放弃。")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9166,7 +9166,7 @@ class AIAgent:
                         pool = self._credential_pool
                         pool_may_recover = pool is not None and pool.has_available()
                         if not pool_may_recover:
-                            self._emit_status("⚠️ Rate limited — switching to fallback provider...")
+                            self._emit_status("⚠️ 请求受限 — 正在切换备用线路…")
                             if self._try_activate_fallback():
                                 retry_count = 0
                                 compression_attempts = 0
@@ -9191,7 +9191,7 @@ class AIAgent:
                                 "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._emit_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+                        self._emit_status(f"⚠️ 请求内容过大（413）— 正在压缩（第 {compression_attempts}/{max_compression_attempts} 次）…")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
@@ -9204,7 +9204,7 @@ class AIAgent:
                         conversation_history = None
 
                         if len(messages) < original_len:
-                            self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                            self._emit_status(f"🗜️ 已压缩 {original_len} → {len(messages)} 条消息，重试中…")
                             time.sleep(2)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
@@ -9321,7 +9321,7 @@ class AIAgent:
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
+                        self._emit_status(f"🗜️ 上下文过长（约 {approx_tokens:,} tokens）— 正在压缩（第 {compression_attempts}/{max_compression_attempts} 次）…")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
@@ -9335,7 +9335,7 @@ class AIAgent:
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
-                                self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                                self._emit_status(f"🗜️ 已压缩 {original_len} → {len(messages)} 条消息，重试中…")
                             time.sleep(2)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
@@ -9381,7 +9381,7 @@ class AIAgent:
                     if is_client_error:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                        self._emit_status(f"⚠️ 不可重试的错误（HTTP {status_code}）— 正在尝试备用线路…")
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
@@ -9391,9 +9391,10 @@ class AIAgent:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="non_retryable_client_error", error=api_error,
                             )
+                        _err_summary = self._summarize_api_error(api_error)
+                        _zh_hint = "\n\n💡 账户余额不足，请充值后重试。" if "insufficient balance" in _err_summary.lower() else ""
                         self._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{self._summarize_api_error(api_error)}"
+                            f"❌ 不可重试的错误（HTTP {status_code}）: {_err_summary}{_zh_hint}"
                         )
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
@@ -9448,17 +9449,18 @@ class AIAgent:
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        self._emit_status(f"⚠️ 已重试 {max_retries} 次仍失败 — 正在尝试备用线路…")
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
                             continue
                         _final_summary = self._summarize_api_error(api_error)
+                        _zh_hint = "\n\n💡 账户余额不足，请充值后重试。" if "insufficient balance" in _final_summary.lower() else ""
                         if is_rate_limited:
-                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                            self._emit_status(f"❌ 请求频率超限，重试 {max_retries} 次后仍失败 — {_final_summary}{_zh_hint}")
                         else:
-                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                            self._emit_status(f"❌ API 调用失败（重试 {max_retries} 次）— {_final_summary}{_zh_hint}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
@@ -9532,9 +9534,9 @@ class AIAgent:
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
-                        self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
+                        self._emit_status(f"⏱️ 请求频率超限，等待 {wait_time:.0f} 秒后重试（第 {retry_count + 1}/{max_retries} 次）…")
                     else:
-                        self._emit_status(f"⏳ Retrying in {wait_time}s (attempt {retry_count}/{max_retries})...")
+                        self._emit_status(f"⏳ {wait_time:.0f} 秒后重试（第 {retry_count}/{max_retries} 次）…")
                     logger.warning(
                         "Retrying API call in %ss (attempt %s/%s) %s error=%s",
                         wait_time,
@@ -10122,7 +10124,7 @@ class AIAgent:
                         if fallback:
                             _turn_exit_reason = "fallback_prior_turn_content"
                             logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-                            self._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
+                            self._emit_status("↻ 工具调用后返回为空 — 使用前一轮内容作为最终回复")
                             self._last_content_with_tools = None
                             self._empty_content_retries = 0
                             for i in range(len(messages) - 1, -1, -1):
