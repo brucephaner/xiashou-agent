@@ -1,0 +1,2 @@
+# macOS-only runtime packages.
+# Empty on purpose — add entries only when a macOS-specific scenario needs them.

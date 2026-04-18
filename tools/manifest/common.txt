@@ -1,0 +1,31 @@
+# Runtime packages manifest (tools/manifest/common.txt) — the "checklist" 后台
+# synced by tools/runtime_packages.py at gateway start for every platform.
+# Format: one pip install name per line; # for comments.
+# Keep this list tight — add a package only when a real user scenario needs it.
+
+# Documents
+openpyxl
+python-docx
+python-pptx
+pymupdf
+pymupdf4llm
+
+# Data
+pandas
+
+# Images
+Pillow
+rapidocr-onnxruntime
+
+# Network / scraping
+requests
+beautifulsoup4
+lxml
+
+# Media / search
+youtube-transcript-api
+ddgs
+pyfiglet
+
+# Universal file-to-markdown
+markitdown

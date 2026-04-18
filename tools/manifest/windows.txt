@@ -1,0 +1,2 @@
+# Windows-only runtime packages.
+# Empty on purpose — add entries only when a Windows-specific scenario needs them.

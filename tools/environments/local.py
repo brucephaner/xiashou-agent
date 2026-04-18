@@ -198,9 +198,32 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
-    existing_path = run_env.get("PATH", "")
-    if "/usr/bin" not in existing_path.split(":"):
-        run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+    if _IS_WINDOWS:
+        # bash -c does not load /etc/profile, so Git Bash's /usr/bin tools
+        # (wc, head, cat, ls, …) are not on PATH when the parent process is
+        # a normal Windows binary. Inject the git runtime's three tool dirs
+        # so subprocess commands find them.
+        try:
+            bash = _find_bash()
+            git_root = os.path.dirname(os.path.dirname(os.path.dirname(bash)))
+            extras = [
+                p for p in (
+                    os.path.join(git_root, "usr", "bin"),
+                    os.path.join(git_root, "mingw64", "bin"),
+                    os.path.join(git_root, "cmd"),
+                ) if os.path.isdir(p)
+            ]
+            if extras:
+                existing = run_env.get("PATH", "")
+                extras_str = os.pathsep.join(extras)
+                if extras_str not in existing:
+                    run_env["PATH"] = f"{extras_str}{os.pathsep}{existing}" if existing else extras_str
+        except Exception:
+            pass
+    else:
+        existing_path = run_env.get("PATH", "")
+        if "/usr/bin" not in existing_path.split(":"):
+            run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
