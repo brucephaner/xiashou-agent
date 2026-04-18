@@ -4825,9 +4825,9 @@ class AIAgent:
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
                 self._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
+                    f"⚠️ 模型 {int(_elapsed)} 秒未响应"
+                    f"（非流式，模型：{api_kwargs.get('model', 'unknown')}），"
+                    f"已中止本次调用。"
                 )
                 try:
                     if self.api_mode == "anthropic_messages":
@@ -5364,9 +5364,9 @@ class AIAgent:
                                     e,
                                 )
                                 self._emit_status(
-                                    f"⚠️ Connection to provider dropped "
-                                    f"({type(e).__name__}). Reconnecting… "
-                                    f"(attempt {_stream_attempt + 2}/{_max_stream_retries + 1})"
+                                    f"⚠️ 与模型的连接中断"
+                                    f"（{type(e).__name__}）— 正在重连…"
+                                    f"（第 {_stream_attempt + 2}/{_max_stream_retries + 1} 次）"
                                 )
                                 self._touch_activity(
                                     f"stream retry {_stream_attempt + 2}/{_max_stream_retries + 1} "
@@ -5389,10 +5389,10 @@ class AIAgent:
                                     pass
                                 continue
                             self._emit_status(
-                                "❌ Connection to provider failed after "
-                                f"{_max_stream_retries + 1} attempts. "
-                                "The provider may be experiencing issues — "
-                                "try again in a moment."
+                                "❌ 连接模型失败，已重试 "
+                                f"{_max_stream_retries + 1} 次。"
+                                "模型服务可能暂时异常，"
+                                "请稍后再试。"
                             )
                             logger.warning(
                                 "Streaming exhausted %s retries on transient error: %s",
@@ -5469,10 +5469,10 @@ class AIAgent:
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
                 self._emit_status(
-                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
-                    f"(model: {api_kwargs.get('model', 'unknown')}, "
-                    f"context: ~{_est_ctx:,} tokens). "
-                    f"Reconnecting..."
+                    f"⚠️ 模型 {int(_stale_elapsed)} 秒未响应"
+                    f"（模型：{api_kwargs.get('model', 'unknown')}，"
+                    f"上下文约 {_est_ctx:,} tokens），"
+                    f"正在重连…"
                 )
                 try:
                     rc = request_client_holder.get("client")
@@ -5679,7 +5679,7 @@ class AIAgent:
                 )
 
             self._emit_status(
-                f"🔄 Primary model failed — switching to fallback: "
+                f"🔄 主模型失败 — 正在切换备用："
                 f"{fb_model} via {fb_provider}"
             )
             logging.info(
@@ -5906,13 +5906,33 @@ class AIAgent:
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()
         except Exception as e:
-            description = f"Image analysis failed: {e}"
+            logger.warning("Cloud vision failed: %s — trying local OCR", e)
         finally:
             if cleanup_path and cleanup_path.exists():
                 try:
                     cleanup_path.unlink()
                 except OSError:
                     pass
+
+        # Cloud failed or returned empty → local OCR text extraction (RapidOCR).
+        # Only works for local paths; URLs were downloaded-and-discarded above.
+        if not description:
+            try:
+                from tools.local_ocr import extract_text
+                candidate = vision_source
+                if candidate.startswith("file://"):
+                    candidate = candidate[len("file://"):]
+                local_path: Optional[Path] = None
+                if not candidate.startswith(("http://", "https://")):
+                    p = Path(os.path.expanduser(candidate))
+                    if p.is_file():
+                        local_path = p
+                if local_path is not None:
+                    ocr_text = extract_text(local_path)
+                    if ocr_text:
+                        description = f"[Local OCR extracted text]\n{ocr_text}"
+            except Exception as e:
+                logger.debug("Local OCR fallback failed: %s", e)
 
         if not description:
             description = "Image analysis failed."
@@ -7751,10 +7771,11 @@ class AIAgent:
         if self.api_mode != "anthropic_messages":
             try:
                 if self._cleanup_dead_connections():
-                    self._emit_status(
-                        "🔌 Detected stale connections from a previous provider "
+                    self._vprint(
+                        f"{self.log_prefix}🔌 Detected stale connections from a previous provider "
                         "issue — cleaned up automatically. Proceeding with fresh "
-                        "connection."
+                        "connection.",
+                        force=True,
                     )
             except Exception:
                 pass
@@ -9140,10 +9161,6 @@ class AIAgent:
                             # messages to the new session, not skipping them.
                             conversation_history = None
                             if len(messages) < original_len or old_ctx > _reduced_ctx:
-                                self._emit_status(
-                                    f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
-                                    f"(was {old_ctx:,}), retrying..."
-                                )
                                 time.sleep(2)
                                 restart_with_compressed_messages = True
                                 break
@@ -10109,8 +10126,8 @@ class AIAgent:
                                 len(_recovered),
                             )
                             self._emit_status(
-                                "↻ Stream interrupted — using delivered content "
-                                "as final response"
+                                "↻ 响应中断 — 使用已接收的内容"
+                                "作为最终回复"
                             )
                             final_response = _recovered
                             self._response_was_previewed = True
@@ -10160,9 +10177,10 @@ class AIAgent:
                                 "prefilling to continue (%d/2)",
                                 self._thinking_prefill_retries,
                             )
-                            self._emit_status(
-                                f"↻ Thinking-only response — prefilling to continue "
-                                f"({self._thinking_prefill_retries}/2)"
+                            self._vprint(
+                                f"{self.log_prefix}↻ Thinking-only response — prefilling to continue "
+                                f"({self._thinking_prefill_retries}/2)",
+                                force=True,
                             )
                             interim_msg = self._build_assistant_message(
                                 assistant_message, "incomplete"
@@ -10196,9 +10214,10 @@ class AIAgent:
                                 "retry %d/3 (model=%s)",
                                 self._empty_content_retries, self.model,
                             )
-                            self._emit_status(
-                                f"⚠️ Empty response from model — retrying "
-                                f"({self._empty_content_retries}/3)"
+                            self._vprint(
+                                f"{self.log_prefix}⚠️ Empty response from model — retrying "
+                                f"({self._empty_content_retries}/3)",
+                                force=True,
                             )
                             continue
 
@@ -10215,15 +10234,17 @@ class AIAgent:
                                 self._empty_content_retries, self.model,
                                 self.provider,
                             )
-                            self._emit_status(
-                                "⚠️ Model returning empty responses — "
-                                "switching to fallback provider..."
+                            self._vprint(
+                                f"{self.log_prefix}⚠️ Model returning empty responses — "
+                                "switching to fallback provider...",
+                                force=True,
                             )
                             if self._try_activate_fallback():
                                 self._empty_content_retries = 0
-                                self._emit_status(
-                                    f"↻ Switched to fallback: {self.model} "
-                                    f"({self.provider})"
+                                self._vprint(
+                                    f"{self.log_prefix}↻ Switched to fallback: {self.model} "
+                                    f"({self.provider})",
+                                    force=True,
                                 )
                                 logger.info(
                                     "Fallback activated after empty responses: "
@@ -10248,9 +10269,10 @@ class AIAgent:
                                 "after exhausting retries and fallback. "
                                 "Reasoning: %s", reasoning_preview,
                             )
-                            self._emit_status(
-                                "⚠️ Model produced reasoning but no visible "
-                                "response after all retries. Returning empty."
+                            self._vprint(
+                                f"{self.log_prefix}⚠️ Model produced reasoning but no visible "
+                                "response after all retries. Returning empty.",
+                                force=True,
                             )
                         else:
                             logger.warning(
@@ -10260,11 +10282,13 @@ class AIAgent:
                                 self._empty_content_retries, self.model,
                                 self.provider,
                             )
-                            self._emit_status(
-                                "❌ Model returned no content after all retries"
-                                + (" and fallback attempts." if self._fallback_chain else
-                                   ". No fallback providers configured.")
-                            )
+
+                        self._emit_status(
+                            "❌ 模型重试后仍未返回内容（"
+                            + ("仅有思考过程，" if reasoning_text else "")
+                            + ("已尝试备用线路" if self._fallback_chain else "未配置备用线路")
+                            + "）。"
+                        )
 
                         final_response = "(empty)"
                         break
@@ -10389,8 +10413,8 @@ class AIAgent:
             # user message and makes a single toolless request.
             _turn_exit_reason = f"max_iterations_reached({api_call_count}/{self.max_iterations})"
             self._emit_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
-                "— asking model to summarise"
+                f"⚠️ 本轮已达最大步数（{api_call_count}/{self.max_iterations}）"
+                "— 正在请模型汇总"
             )
             if not self.quiet_mode:
                 self._safe_print(

@@ -21,6 +21,17 @@ from urllib.parse import urlsplit
 logger = logging.getLogger(__name__)
 
 
+# Chinese command-name aliases. The scope args (全部/本次/永久) are handled
+# in the individual command handlers; this table covers only the command
+# name itself so /批准 dispatches the same as /approve.
+_COMMAND_ALIASES_ZH: dict[str, str] = {
+    "批准": "approve",
+    "同意": "approve",
+    "拒绝": "deny",
+    "取消": "deny",
+}
+
+
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
 
@@ -706,6 +717,11 @@ class MessageEvent:
         # Reject file paths: valid command names never contain /
         if raw and "/" in raw:
             return None
+        # Chinese aliases for user-facing commands. Args still flow through
+        # get_command_args() unchanged, and most handlers already accept
+        # Chinese scope tokens (全部/本次/永久) inline.
+        if raw in _COMMAND_ALIASES_ZH:
+            raw = _COMMAND_ALIASES_ZH[raw]
         return raw
     
     def get_command_args(self) -> str:

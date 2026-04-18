@@ -316,6 +316,61 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+# Translations for approval reasons shown in the dangerous-command prompt.
+# Keys must match the second element of the tuples in tools/approval.py
+# DANGEROUS_PATTERNS. If a reason is not in this table, the English text is
+# shown verbatim (safe fallback for newly-added patterns).
+_APPROVAL_REASON_ZH: dict[str, str] = {
+    "delete in root path": "删除根目录下的文件",
+    "recursive delete": "删除整个文件夹（rm -r）",
+    "recursive delete (long flag)": "删除整个文件夹",
+    "world/other-writable permissions": "开放写权限给所有人",
+    "recursive world/other-writable (long flag)": "批量开放写权限",
+    "recursive chown to root": "把文件所有者改成 root",
+    "recursive chown to root (long flag)": "把文件所有者改成 root",
+    "format filesystem": "格式化磁盘",
+    "disk copy": "直接操作磁盘（dd）",
+    "write to block device": "直接写入硬盘",
+    "SQL DROP": "删除数据库或表",
+    "SQL DELETE without WHERE": "清空整张表",
+    "SQL TRUNCATE": "清空数据库表",
+    "overwrite system config": "改动系统配置",
+    "stop/disable system service": "停掉系统服务",
+    "kill all processes": "杀掉所有进程",
+    "force kill processes": "强制杀进程",
+    "fork bomb": "fork 炸弹（会让机器卡死）",
+    "shell command via -c/-lc flag": "运行系统命令",
+    "script execution via -e/-c flag": "运行一段代码",
+    "pipe remote content to shell": "下载并运行远程脚本",
+    "execute remote script via process substitution": "运行远程脚本",
+    "overwrite system file via tee": "写入系统文件",
+    "overwrite system file via redirection": "写入系统文件",
+    "xargs with rm": "批量删除文件",
+    "find -exec rm": "批量删除文件",
+    "find -delete": "批量删除文件",
+    "kill hermes/gateway process (self-termination)": "杀掉自己（代理进程）",
+    "kill process via pgrep expansion (self-termination)": "杀掉自己（代理进程）",
+    "kill process via backtick pgrep expansion (self-termination)": "杀掉自己（代理进程）",
+    "copy/move file into /etc/": "复制/移动到系统目录",
+    "in-place edit of system config": "直接改系统配置文件",
+    "in-place edit of system config (long flag)": "直接改系统配置文件",
+    "script execution via heredoc": "运行一段代码",
+    "git reset --hard (destroys uncommitted changes)": "git 强制重置（会丢失未提交的修改）",
+    "dangerous command": "这条命令可能有风险",
+}
+
+
+def _translate_approval_reason(desc: str) -> str:
+    """Best-effort translation of approval reason for user-facing display."""
+    if not desc:
+        return "这条命令可能有风险"
+    # Some reasons include a parenthetical hint like
+    # "start gateway outside systemd (use 'systemctl ...')". Split on the
+    # hint and translate the leading phrase; drop the hint for end users.
+    key = desc.split(" (use ", 1)[0].strip()
+    return _APPROVAL_REASON_ZH.get(key, _APPROVAL_REASON_ZH.get(desc, desc))
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
@@ -5419,7 +5474,7 @@ class GatewayRunner:
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "（未生成回复）",
+                        content=header.rstrip(),
                         metadata=_thread_metadata,
                     )
 
@@ -5447,7 +5502,7 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ 后台任务完成\n任务: "{preview}"\n\n（未生成回复）',
+                    content=f'✅ 后台任务完成\n任务: "{preview}"',
                     metadata=_thread_metadata,
                 )
 
@@ -5585,7 +5640,7 @@ class GatewayRunner:
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
             if not response:
-                response = "（未生成回复）"
+                response = "（没想到好答案，换个问法试试？）"
 
             media_files, response = adapter.extract_media(response)
             images, text_content = adapter.extract_images(response)
@@ -5601,7 +5656,7 @@ class GatewayRunner:
             elif not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=header + "（未生成回复）",
+                    content=header.rstrip(),
                     metadata=_thread_meta,
                 )
 
@@ -6437,8 +6492,8 @@ class GatewayRunner:
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
-                return "⚠️ 授权已过期（代理不再等待），请让代理重试。"
-            return "没有待批准的命令。"
+                return "⚠️ 等得太久，这次没等到你，请再让我试一遍。"
+            return "现在没有等你确认的操作。"
 
         # Parse args: support "all", "all session", "all always", "session", "always"
         # Chinese aliases: 全部=all, 永久=always, 本次=session
@@ -6448,26 +6503,26 @@ class GatewayRunner:
 
         if any(a in ("always", "permanent", "permanently", "永久") for a in remaining):
             choice = "always"
-            scope_msg = "（此类操作已永久批准）"
+            scope_msg = "（以后同样的操作不再问你）"
         elif any(a in ("session", "ses", "本次") for a in remaining):
             choice = "session"
-            scope_msg = "（此类操作已为本次会话批准）"
+            scope_msg = "（本次对话里同样的操作不再问你）"
         else:
             choice = "once"
             scope_msg = ""
 
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
         if not count:
-            return "没有待批准的命令。"
+            return "现在没有等你确认的操作。"
 
         # Resume typing indicator — agent is about to continue processing.
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        count_msg = f"（共 {count} 条命令）" if count > 1 else ""
+        count_msg = f"（共 {count} 条）" if count > 1 else ""
         logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
-        return f"✅ 命令已批准{scope_msg}{count_msg}，代理正在恢复执行..."
+        return f"✅ 好的{scope_msg}{count_msg}，继续帮你做…"
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny command — reject pending dangerous command(s).
@@ -6487,24 +6542,24 @@ class GatewayRunner:
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
-                return "❌ 命令已拒绝（授权已过期）。"
-            return "没有待拒绝的命令。"
+                return "好的，这次就不做了。"
+            return "现在没有等你确认的操作。"
 
         args = event.get_command_args().strip().lower()
         resolve_all = "all" in args or "全部" in args
 
         count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
         if not count:
-            return "没有待拒绝的命令。"
+            return "现在没有等你确认的操作。"
 
         # Resume typing indicator — agent continues (with BLOCKED result).
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        count_msg = f"（共 {count} 条命令）" if count > 1 else ""
+        count_msg = f"（共 {count} 条）" if count > 1 else ""
         logger.info("User denied %d dangerous command(s) via /deny", count)
-        return f"❌ 命令已拒绝{count_msg}。"
+        return f"好的，这次就不做了{count_msg}。"
 
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
@@ -8103,14 +8158,16 @@ class GatewayRunner:
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                zh_desc = _translate_approval_reason(desc)
                 msg = (
-                    f"⚠️ **危险命令需要授权：**\n"
+                    f"需要你确认一下：\n"
                     f"```\n{cmd_preview}\n```\n"
-                    f"原因: {desc}\n\n"
-                    f"回复 `/approve`（/批准）执行，"
-                    f"`/approve session`（/批准 本次）为本次会话批准此类操作，"
-                    f"`/approve always`（/批准 永久）永久批准此类操作，"
-                    f"或 `/deny`（/拒绝）取消。"
+                    f"（{zh_desc}）\n\n"
+                    f"回复：\n"
+                    f"• /批准 — 同意这次\n"
+                    f"• /批准 本次 — 本次对话里别再问我\n"
+                    f"• /批准 永久 — 以后都不用问了\n"
+                    f"• /拒绝 — 不执行"
                 )
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -8159,7 +8216,7 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else "（未生成回复）"
+                error_msg = f"⚠️ {result['error']}" if result.get("error") else "⚠️ 这次没跑出结果，请再试一下"
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -8921,6 +8978,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Sync runtime Python packages from tools/manifest/ in the background so
+    # common small-user scenarios (Excel/Word/PDF/images/scraping) don't hit
+    # the first-use approval-and-install path. Daemon thread, non-blocking.
+    # Runs after setup_logging so outcome lands in agent.log.
+    try:
+        from tools.runtime_packages import sync_runtime_packages_async
+        sync_runtime_packages_async()
+    except Exception:
+        pass
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
