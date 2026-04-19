@@ -4785,6 +4785,7 @@ For more help on a command:
     gateway_install.add_argument("--force", action="store_true", help="Force reinstall")
     gateway_install.add_argument("--system", action="store_true", help="Install as a Linux system-level service (starts at boot)")
     gateway_install.add_argument("--run-as-user", dest="run_as_user", help="User account the Linux system service should run as")
+    gateway_install.add_argument("--no-start", dest="no_start", action="store_true", help="Write the service definition but don't load/start it (host will drive startup)")
     
     # gateway uninstall
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")

@@ -1379,9 +1379,19 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
-def launchd_install(force: bool = False):
+def launchd_install(force: bool = False, no_start: bool = False):
     plist_path = get_launchd_plist_path()
-    
+
+    # Host-managed mode: write the plist but skip bootout/bootstrap so the
+    # service stays unloaded. The host (e.g. 叨灵 desktop shell) will call
+    # `gateway start` explicitly once config.yaml / .env are fully written,
+    # avoiding the "daemon boots with empty env, never reloads" class of bug.
+    if no_start:
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(generate_launchd_plist())
+        print(f"✓ Service definition written (not loaded): {plist_path}")
+        return
+
     if plist_path.exists() and not force:
         if not launchd_plist_is_current():
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
@@ -2823,6 +2833,7 @@ def gateway_command(args):
         force = getattr(args, 'force', False)
         system = getattr(args, 'system', False)
         run_as_user = getattr(args, 'run_as_user', None)
+        no_start = getattr(args, 'no_start', False)
         if is_termux():
             print("Gateway service installation is not supported on Termux.")
             print("Run manually: hermes gateway")
@@ -2835,7 +2846,7 @@ def gateway_command(args):
                 print()
             systemd_install(force=force, system=system, run_as_user=run_as_user)
         elif is_macos():
-            launchd_install(force)
+            launchd_install(force, no_start=no_start)
         elif is_wsl():
             print("WSL detected but systemd is not running.")
             print("Either enable systemd (add systemd=true to /etc/wsl.conf and restart WSL)")
