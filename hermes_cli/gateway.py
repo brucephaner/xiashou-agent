@@ -812,6 +812,37 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+# Environment variables a host app (e.g. the 叨灵 desktop shell) may set
+# before calling `hermes gateway install --force`. If set, propagate them
+# into the generated plist / systemd unit so the daemonized gateway sees
+# the same brand + managed-mode flags that the shell-driven `hermes_command`
+# calls already get. Without this the launchd-owned gateway reports the
+# upstream framework name when asked its version.
+_HOST_FORWARDED_ENV_VARS = ("DAOLING_BRAND", "DAOLING_VERSION", "HERMES_MANAGED")
+
+
+def _host_forwarded_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in _HOST_FORWARDED_ENV_VARS if os.environ.get(k)}
+
+
+def _plist_env_xml(env: dict[str, str]) -> str:
+    """Render additional <key>/<string> pairs for an <EnvironmentVariables> dict."""
+    if not env:
+        return ""
+    lines = []
+    for k, v in env.items():
+        escaped = v.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f"        <key>{k}</key>")
+        lines.append(f"        <string>{escaped}</string>")
+    return "\n".join(lines)
+
+
+def _systemd_env_lines(env: dict[str, str]) -> str:
+    if not env:
+        return ""
+    return "\n".join(f'Environment="{k}={v}"' for k, v in env.items())
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
@@ -846,6 +877,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)
+        host_env = _systemd_env_lines(_host_forwarded_env())
+        host_env_block = f"\n{host_env}" if host_env else ""
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -864,7 +897,7 @@ Environment="USER={username}"
 Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
-Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_HOME={hermes_home}"{host_env_block}
 Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -884,6 +917,8 @@ WantedBy=multi-user.target
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(common_bin_paths)
     sane_path = ":".join(path_entries)
+    host_env = _systemd_env_lines(_host_forwarded_env())
+    host_env_block = f"\n{host_env}" if host_env else ""
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network.target
@@ -896,7 +931,7 @@ ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
-Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_HOME={hermes_home}"{host_env_block}
 Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -1266,6 +1301,9 @@ def generate_launchd_plist() -> str:
     ])
     prog_args_xml = "\n        ".join(prog_args)
 
+    host_env_xml = _plist_env_xml(_host_forwarded_env())
+    host_env_block = f"\n{host_env_xml}" if host_env_xml else ""
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1277,10 +1315,10 @@ def generate_launchd_plist() -> str:
     <array>
         {prog_args_xml}
     </array>
-    
+
     <key>WorkingDirectory</key>
     <string>{working_dir}</string>
-    
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -1288,7 +1326,7 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{host_env_block}
     </dict>
     
     <key>RunAtLoad</key>
