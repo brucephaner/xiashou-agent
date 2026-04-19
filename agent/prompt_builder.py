@@ -131,15 +131,37 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
-DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
-)
+def _compute_default_agent_identity() -> str:
+    """Build the fallback identity string from host-provided brand/version.
+
+    Read at module import time so all downstream users see a plain string
+    constant. Host apps set `DAOLING_BRAND` / `DAOLING_VERSION` env vars
+    before spawning this process; absent those, `get_brand()` /
+    `get_display_version()` fall back to neutral framework values.
+
+    The version-query guidance line is there so the LLM doesn't reach
+    for the shell tool (and trigger an approval prompt on gateways that
+    gate shell commands) to look up a version that's already right here.
+    """
+    from hermes_cli import get_brand, get_display_version
+
+    brand = get_brand()
+    version = get_display_version()
+    return (
+        f"You are {brand} v{version}, an intelligent AI assistant. "
+        "You are helpful, knowledgeable, and direct. You assist users with a wide "
+        "range of tasks including answering questions, writing and editing code, "
+        "analyzing information, creative work, and executing actions via your tools. "
+        "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+        "being genuinely useful over being verbose unless otherwise directed below. "
+        "Be targeted and efficient in your exploration and investigations. "
+        "When the user asks about your identity or version, answer with "
+        f'exactly "{brand} v{version}" and do NOT run shell commands '
+        "(like `cat package.json`) to look it up — the answer is already here."
+    )
+
+
+DEFAULT_AGENT_IDENTITY = _compute_default_agent_identity()
 
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
@@ -357,12 +379,15 @@ PLATFORM_HINTS = {
         ".heic) appear as photos and other files arrive as attachments."
     ),
     "weixin": (
-        "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
-        "it improves readability, but keep the message compact and chat-friendly. You can send media files natively: "
-        "include MEDIA:/absolute/path/to/file in your response. Images are sent as native "
-        "photos, videos play inline when supported, and other files arrive as downloadable "
-        "documents. You can also include image URLs in markdown format ![alt](url) and they "
-        "will be downloaded and sent as native media when possible."
+        "You are on Weixin/WeChat. Markdown formatting is partially supported, so you may use "
+        "bold/italics/lists when it improves readability, but keep the message compact and "
+        "chat-friendly. IMPORTANT: do NOT use Markdown pipe tables (the `| col | col |` "
+        "syntax) — WeChat does not render them and the raw pipes appear as noise. For "
+        "tabular comparisons use line-separated text or numbered lists instead. You can send "
+        "media files natively: include MEDIA:/absolute/path/to/file in your response. Images "
+        "are sent as native photos, videos play inline when supported, and other files arrive "
+        "as downloadable documents. You can also include image URLs in markdown format "
+        "![alt](url) and they will be downloaded and sent as native media when possible."
     ),
     "wecom": (
         "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
