@@ -232,10 +232,10 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
+        assert "定时任务回复: daily-report" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
-        assert "The agent cannot see this message" in sent_content
+        assert "这是定时任务转发结果。如需追问，请引用这条消息。" in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -256,7 +256,7 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert "定时任务回复: abc-123" in sent_content
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -281,8 +281,8 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert sent_content == "Clean output only."
-        assert "Cronjob Response" not in sent_content
-        assert "The agent cannot see" not in sent_content
+        assert "定时任务回复" not in sent_content
+        assert "这是定时任务转发结果" not in sent_content
 
     def test_delivery_extracts_media_tags_before_send(self):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""

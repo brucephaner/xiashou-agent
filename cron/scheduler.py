@@ -289,7 +289,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivery_content = (
             f"定时任务回复: {task_name}\n"
             f"-------------\n\n"
-            f"{content}"
+            f"{content}\n\n"
+            f"这是定时任务转发结果。如需追问，请引用这条消息。"
         )
     else:
         delivery_content = content
