@@ -163,6 +163,38 @@ def _compute_default_agent_identity() -> str:
 
 DEFAULT_AGENT_IDENTITY = _compute_default_agent_identity()
 
+
+def _compute_host_identity_meta() -> str:
+    """Host-provided brand + version as a short meta block.
+
+    Unlike DEFAULT_AGENT_IDENTITY (which gets REPLACED by SOUL.md when
+    SOUL.md exists — see run_agent.py:3117-3124), this is injected as a
+    separate slot that always runs. Without this, a user-customized
+    SOUL.md hides the version info and the LLM falls back to shelling out
+    for `cat __init__.py` and confidently reporting "Hermes Agent v0.9.0".
+    Only emits anything when the host actually set DAOLING_BRAND /
+    DAOLING_VERSION — bare-framework CLI users see nothing.
+    """
+    from hermes_cli import get_brand, get_display_version
+    import os as _os
+
+    if not (_os.environ.get("DAOLING_BRAND") or _os.environ.get("DAOLING_VERSION")):
+        return ""
+
+    brand = get_brand()
+    version = get_display_version()
+    return (
+        f"Product identity fact (authoritative): You are {brand} v{version}. "
+        f"When the user asks what version you are or what product this is, "
+        f"answer exactly \"{brand} v{version}\" — do NOT attempt to look it "
+        f"up by running shell commands (`cat`, `python -c`, reading package "
+        f"metadata, etc.): those read internal framework version strings that "
+        f"are NOT the user-facing product version. The answer is here, trust it."
+    )
+
+
+HOST_IDENTITY_META = _compute_host_identity_meta()
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "

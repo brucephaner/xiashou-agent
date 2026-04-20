@@ -79,7 +79,7 @@ from agent.memory_manager import build_memory_context_block
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
+    DEFAULT_AGENT_IDENTITY, HOST_IDENTITY_META, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     build_nous_subscription_prompt,
 )
@@ -3122,6 +3122,14 @@ class AIAgent:
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+
+        # Host brand + version fact — injected regardless of which identity
+        # layer won above. SOUL.md replaces DEFAULT_AGENT_IDENTITY whole, so
+        # without this slot a customized SOUL.md hides the version info and
+        # the model confidently hallucinates "Hermes Agent v0.9.0". Empty
+        # string when the host didn't set DAOLING_BRAND / DAOLING_VERSION.
+        if HOST_IDENTITY_META:
+            prompt_parts.append(HOST_IDENTITY_META)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
