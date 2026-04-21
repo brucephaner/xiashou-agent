@@ -29,6 +29,144 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.8 fallback
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+
+
+_DIRECT_TIME_SHARED_THREAD_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")
+_DIRECT_TIME_PREFIX_RE = re.compile(
+    r"^(?:请问|麻烦|帮我(?:看下|查下|确认下)?|告诉我|我想知道|想知道)+"
+)
+_DIRECT_TIME_QUERY_TAIL_RE = re.compile(
+    r"^(?:(?:现在|当前|此刻)(?:是)?)?"
+    r"(?:几点了?|多少点|时间|日期时间|日期|几号|多少号)?"
+    r"(?:吗|呢|呀|啊)?$"
+)
+_LOCAL_DIRECT_TIME_QUERY_RE = re.compile(
+    r"^(?:现在|当前|此刻)(?:是)?"
+    r"(?:几点了?|多少点|时间|日期时间|日期|几号|多少号)"
+    r"(?:吗|呢|呀|啊)?$"
+)
+_DIRECT_TIME_SKIP_TERMS = (
+    "提醒",
+    "定时",
+    "闹钟",
+    "倒计时",
+    "转换",
+    "换算",
+    "时差",
+    "明天",
+    "昨天",
+    "后天",
+    "下周",
+    "本周",
+    "上周",
+)
+_LOCAL_DIRECT_DATE_QUERIES = {"今天几号", "今天多少号", "今天日期"}
+_DIRECT_TIME_ZONE_ALIASES = (
+    ("中国标准时间", "Asia/Shanghai", "北京时间"),
+    ("北京时间", "Asia/Shanghai", "北京时间"),
+    ("中国时间", "Asia/Shanghai", "北京时间"),
+    ("上海时间", "Asia/Shanghai", "上海时间"),
+    ("香港时间", "Asia/Hong_Kong", "香港时间"),
+    ("台北时间", "Asia/Taipei", "台北时间"),
+    ("东京时间", "Asia/Tokyo", "东京时间"),
+    ("首尔时间", "Asia/Seoul", "首尔时间"),
+    ("纽约时间", "America/New_York", "纽约时间"),
+    ("洛杉矶时间", "America/Los_Angeles", "洛杉矶时间"),
+    ("伦敦时间", "Europe/London", "伦敦时间"),
+    ("协调世界时", "UTC", "UTC"),
+    ("utc", "UTC", "UTC"),
+    ("北京", "Asia/Shanghai", "北京时间"),
+    ("中国", "Asia/Shanghai", "北京时间"),
+    ("上海", "Asia/Shanghai", "上海时间"),
+    ("香港", "Asia/Hong_Kong", "香港时间"),
+    ("台北", "Asia/Taipei", "台北时间"),
+    ("东京", "Asia/Tokyo", "东京时间"),
+    ("首尔", "Asia/Seoul", "首尔时间"),
+    ("纽约", "America/New_York", "纽约时间"),
+    ("洛杉矶", "America/Los_Angeles", "洛杉矶时间"),
+    ("伦敦", "Europe/London", "伦敦时间"),
+)
+
+
+def _normalize_direct_time_query_text(text: str) -> str:
+    """Normalize narrow "what time is it" queries for direct gateway replies."""
+    normalized = (text or "").strip().lower()
+    normalized = _DIRECT_TIME_SHARED_THREAD_PREFIX_RE.sub("", normalized)
+    normalized = re.sub(r"[，,。！？?!.、:：;；~～\u3000\s]", "", normalized)
+    normalized = _DIRECT_TIME_PREFIX_RE.sub("", normalized, count=1)
+    return normalized
+
+
+def _match_direct_time_query(text: str) -> Optional[tuple[Optional[str], Optional[str]]]:
+    """Return ``(tz_name, label)`` for simple current-time queries, else None."""
+    normalized = _normalize_direct_time_query_text(text)
+    if not normalized:
+        return None
+    if any(term in normalized for term in _DIRECT_TIME_SKIP_TERMS):
+        return None
+
+    for alias, tz_name, label in _DIRECT_TIME_ZONE_ALIASES:
+        if alias not in normalized:
+            continue
+        remainder = normalized.replace(alias, "", 1)
+        if _DIRECT_TIME_QUERY_TAIL_RE.fullmatch(remainder):
+            return tz_name, label
+
+    if normalized in _LOCAL_DIRECT_DATE_QUERIES:
+        return None, None
+    if _LOCAL_DIRECT_TIME_QUERY_RE.fullmatch(normalized):
+        return None, None
+    return None
+
+
+def _direct_time_now() -> datetime:
+    """Current wall-clock instant as an aware datetime."""
+    from hermes_time import now as _hermes_now
+
+    return _hermes_now()
+
+
+def _zh_day_period(hour: int) -> str:
+    if hour < 6:
+        return "凌晨"
+    if hour < 12:
+        return "上午"
+    if hour == 12:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    return "晚上"
+
+
+def _format_direct_time_reply(current: datetime, *, label: Optional[str]) -> str:
+    hour12 = current.hour % 12 or 12
+    prefix = f"现在是{label} " if label else "现在是 "
+    return (
+        f"{prefix}{current.year}年{current.month}月{current.day}日 "
+        f"{_zh_day_period(current.hour)}{hour12}点{current.minute:02d}分。"
+    )
+
+
+def _maybe_build_direct_time_reply(text: str) -> Optional[str]:
+    """Directly answer narrow current-time questions without invoking the LLM."""
+    match = _match_direct_time_query(text)
+    if match is None:
+        return None
+
+    tz_name, label = match
+    try:
+        current = _direct_time_now()
+        if tz_name:
+            current = current.astimezone(ZoneInfo(tz_name))
+        return _format_direct_time_reply(current, label=label)
+    except Exception as exc:
+        logger.debug("direct time reply failed for %r: %s", text, exc)
+        return None
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -3954,6 +4092,36 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+
+        direct_time_reply = _maybe_build_direct_time_reply(message_text)
+        if direct_time_reply is not None:
+            ts = datetime.now().isoformat()
+            if not history:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "tools": [],
+                        "model": _resolve_gateway_model(),
+                        "platform": source.platform.value if source.platform else "",
+                        "timestamp": ts,
+                    },
+                )
+            self.session_store.append_to_transcript(
+                session_entry.session_id,
+                {"role": "user", "content": message_text, "timestamp": ts},
+            )
+            self.session_store.append_to_transcript(
+                session_entry.session_id,
+                {"role": "assistant", "content": direct_time_reply, "timestamp": ts},
+            )
+            self.session_store.update_session(
+                session_entry.session_key,
+                last_prompt_tokens=0,
+            )
+            if session_key:
+                self._clear_restart_failure_count(session_key)
+            return direct_time_reply
 
         try:
             # Emit agent:start hook
