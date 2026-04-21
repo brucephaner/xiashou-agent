@@ -371,6 +371,28 @@ def _translate_approval_reason(desc: str) -> str:
     return _APPROVAL_REASON_ZH.get(key, _APPROVAL_REASON_ZH.get(desc, desc))
 
 
+def _format_long_running_status_message(
+    elapsed_mins: int,
+    activity: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the user-facing heartbeat for long-running gateway turns."""
+    parts: List[str] = []
+    if activity:
+        api_call_count = activity.get("api_call_count")
+        max_iterations = activity.get("max_iterations")
+        if api_call_count is not None and max_iterations is not None:
+            parts.append(f"第 {api_call_count}/{max_iterations} 次迭代")
+        current_tool = activity.get("current_tool")
+        if current_tool:
+            parts.append(f"正在运行：{current_tool}")
+        else:
+            last_activity_desc = str(activity.get("last_activity_desc", "") or "").strip()
+            if last_activity_desc:
+                parts.append(last_activity_desc)
+    detail = f"，{'，'.join(parts)}" if parts else ""
+    return f"⏳ 还在处理中...（已耗时 {elapsed_mins} 分钟{detail}）"
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
@@ -8421,22 +8443,19 @@ class GatewayRunner:
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
+                _activity_summary = None
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _activity_summary = _agent_ref.get_activity_summary()
                     except Exception:
                         pass
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        _format_long_running_status_message(
+                            _elapsed_mins,
+                            _activity_summary,
+                        ),
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
