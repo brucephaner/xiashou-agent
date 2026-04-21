@@ -3545,8 +3545,9 @@ class GatewayRunner:
         if not history and not self.session_store.has_any_sessions():
             context_prompt += (
                 "\n\n[System note: This is the user's very first message ever. "
-                "Briefly introduce yourself and mention that /help shows available commands. "
-                "Keep the introduction concise -- one or two sentences max.]"
+                "Briefly introduce yourself. "
+                "Keep the introduction concise -- one or two sentences max. "
+                "Do not proactively mention /help unless the user explicitly asks.]"
             )
         
         # One-time prompt if no home channel is set for this platform
