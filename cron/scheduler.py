@@ -289,10 +289,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     if wrap_response:
         task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
         delivery_content = (
             f"定时任务回复: {task_name}\n"
-            f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
             f"这是定时任务转发结果。如需停用或管理这个任务，请给我发新消息（例如“停止提醒 {task_name}”）。"

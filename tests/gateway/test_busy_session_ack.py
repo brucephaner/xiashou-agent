@@ -124,7 +124,7 @@ class TestBusySessionAck:
         if not content and call_kwargs.args:
             # positional args
             content = str(call_kwargs)
-        assert "打断" in content or "马上处理" in content
+        assert content == "⚡ 正在切换处理你的新消息，马上回复你。"
         assert "/stop" not in content  # no need — we ARE interrupting
 
         # Verify message was queued in adapter pending
@@ -209,8 +209,8 @@ class TestBusySessionAck:
         assert adapter._send_with_retry.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_includes_status_detail(self):
-        """Ack message should include iteration and tool info when available."""
+    async def test_busy_ack_stays_non_technical(self):
+        """Ack message should stay generic even when activity details exist."""
         runner, sentinel = _make_runner()
         adapter = _make_adapter()
 
@@ -234,9 +234,10 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
-        assert "21/60" in content  # iteration
-        assert "terminal" in content  # current tool
-        assert "10 分钟" in content  # elapsed
+        assert content == "⚡ 正在切换处理你的新消息，马上回复你。"
+        assert "21/60" not in content
+        assert "terminal" not in content
+        assert "10 分钟" not in content
 
     @pytest.mark.asyncio
     async def test_draining_still_works(self):

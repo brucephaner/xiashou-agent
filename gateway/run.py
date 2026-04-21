@@ -1509,28 +1509,7 @@ class GatewayRunner:
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment
-        status_parts = []
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"已运行 {elapsed_min} 分钟")
-                if max_iter:
-                    status_parts.append(f"迭代 {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"当前工具 {current_tool}")
-            except Exception:
-                pass
-
-        status_detail = f"（{'，'.join(status_parts)}）" if status_parts else ""
-        message = f"⚡ 正在打断当前任务{status_detail}，马上处理你的新消息。"
+        message = "⚡ 正在切换处理你的新消息，马上回复你。"
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         try:

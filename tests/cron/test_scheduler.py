@@ -235,7 +235,6 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "定时任务回复: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "这是定时任务转发结果。如需停用或管理这个任务" in sent_content
