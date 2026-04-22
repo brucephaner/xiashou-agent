@@ -3,10 +3,12 @@
 Verifies that:
 - _should_reset() returns a reason string ("idle" or "daily") instead of bool
 - SessionEntry captures auto_reset_reason
+- Suspend reasons distinguish interrupted restarts from fresh-start resets
 - SessionResetPolicy.notify controls whether notifications are sent
 - notify_exclude_platforms skips notifications for excluded platforms
 """
 
+import json
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -18,7 +20,13 @@ from gateway.config import (
     PlatformConfig,
     SessionResetPolicy,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SUSPEND_REASON_INTERRUPTED_RESTART,
+    SUSPEND_REASON_MANUAL_STOP,
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +172,82 @@ class TestSessionEntryReason:
         entry2 = store.get_or_create_session(source)
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
+
+    def test_interrupted_restart_preserves_session_and_sets_resume_notice(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="none"),
+            tmp_path,
+        )
+        source = _make_source()
+
+        entry1 = store.get_or_create_session(source)
+        original_session_id = entry1.session_id
+
+        assert store.suspend_recently_active() == 1
+
+        entry2 = store.get_or_create_session(source)
+        assert entry2.was_auto_reset is False
+        assert entry2.session_id == original_session_id
+        assert entry2.resume_notice_reason == SUSPEND_REASON_INTERRUPTED_RESTART
+        assert entry2.suspended is False
+        assert entry2.suspend_reason is None
+
+    def test_manual_stop_still_auto_resets_with_reason(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="none"),
+            tmp_path,
+        )
+        source = _make_source()
+
+        entry1 = store.get_or_create_session(source)
+        assert store.suspend_session(
+            entry1.session_key,
+            reason=SUSPEND_REASON_MANUAL_STOP,
+        )
+
+        entry2 = store.get_or_create_session(source)
+        assert entry2.was_auto_reset is True
+        assert entry2.auto_reset_reason == SUSPEND_REASON_MANUAL_STOP
+        assert entry2.session_id != entry1.session_id
+
+    def test_legacy_suspended_entry_migrates_to_resume_notice(self, tmp_path):
+        source = _make_source()
+        sessions_file = tmp_path / "sessions.json"
+        now = datetime.now().isoformat()
+        legacy_entry = {
+            "session_key": "agent:main:telegram:dm:123",
+            "session_id": "legacy_session",
+            "created_at": now,
+            "updated_at": now,
+            "display_name": None,
+            "platform": "telegram",
+            "chat_type": "dm",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "last_prompt_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "cost_status": "unknown",
+            "memory_flushed": False,
+            "suspended": True,
+        }
+        sessions_file.write_text(
+            json.dumps({legacy_entry["session_key"]: legacy_entry}),
+            encoding="utf-8",
+        )
+
+        store = _make_store(
+            SessionResetPolicy(mode="none"),
+            tmp_path,
+        )
+        entry = store.get_or_create_session(source)
+
+        assert entry.session_id == "legacy_session"
+        assert entry.was_auto_reset is False
+        assert entry.resume_notice_reason == SUSPEND_REASON_INTERRUPTED_RESTART
+        assert entry.suspended is False
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,19 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+SUSPEND_REASON_MANUAL_STOP = "manual_stop"
+SUSPEND_REASON_INTERRUPTED_RESTART = "interrupted_restart"
+SUSPEND_REASON_STUCK_LOOP = "stuck_loop"
+
+# Legacy sessions only stored `suspended: true` with no reason. Prefer the
+# least-destructive migration path: keep history and surface a resume notice
+# instead of blindly wiping context.
+_LEGACY_SUSPEND_REASON = SUSPEND_REASON_INTERRUPTED_RESTART
+_AUTO_RESET_SUSPEND_REASONS = frozenset(
+    {SUSPEND_REASON_MANUAL_STOP, SUSPEND_REASON_STUCK_LOOP}
+)
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
@@ -363,8 +376,11 @@ class SessionEntry:
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
     was_auto_reset: bool = False
-    auto_reset_reason: Optional[str] = None  # "idle" or "daily"
+    auto_reset_reason: Optional[str] = None  # "idle", "daily", or a suspend reason
     reset_had_activity: bool = False  # whether the expired session had any messages
+    # One-shot notice for sessions resumed after an interrupted restart. The
+    # next message keeps prior context but surfaces a warning to the user/agent.
+    resume_notice_reason: Optional[str] = None
     
     # Set by the background expiry watcher after it successfully flushes
     # memories for this session.  Persisted to sessions.json so the flag
@@ -372,10 +388,14 @@ class SessionEntry:
     # set was lost on restart, causing redundant re-flushes).
     memory_flushed: bool = False
 
-    # When True the next call to get_or_create_session() will auto-reset
-    # this session (create a new session_id) so the user starts fresh.
-    # Set by /stop to break stuck-resume loops (#7536).
+    # Suspension metadata. `suspended` is kept for backward compatibility
+    # with older on-disk sessions/tests; `suspend_reason` drives behavior.
+    #
+    # - manual_stop: next message starts fresh
+    # - stuck_loop: next message starts fresh
+    # - interrupted_restart: keep history, show a resume warning once
     suspended: bool = False
+    suspend_reason: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -395,7 +415,9 @@ class SessionEntry:
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
+            "resume_notice_reason": self.resume_notice_reason,
             "suspended": self.suspended,
+            "suspend_reason": self.suspend_reason,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -414,6 +436,11 @@ class SessionEntry:
             except ValueError as e:
                 logger.debug("Unknown platform value %r: %s", data["platform"], e)
         
+        suspend_reason = data.get("suspend_reason")
+        legacy_suspended = data.get("suspended", False)
+        if suspend_reason is None and legacy_suspended:
+            suspend_reason = _LEGACY_SUSPEND_REASON
+
         return cls(
             session_key=data["session_key"],
             session_id=data["session_id"],
@@ -432,7 +459,9 @@ class SessionEntry:
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
-            suspended=data.get("suspended", False),
+            resume_notice_reason=data.get("resume_notice_reason"),
+            suspended=bool(legacy_suspended or suspend_reason),
+            suspend_reason=suspend_reason,
         )
 
 
@@ -708,10 +737,20 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
 
-                # Auto-reset sessions marked as suspended (e.g. after /stop
-                # broke a stuck loop — #7536).
+                # Session suspension is reason-aware:
+                # - manual_stop / stuck_loop -> auto-reset on next access
+                # - interrupted_restart      -> keep history, resume with notice
                 if entry.suspended:
-                    reset_reason = "suspended"
+                    suspend_reason = entry.suspend_reason or _LEGACY_SUSPEND_REASON
+                    if suspend_reason in _AUTO_RESET_SUSPEND_REASONS:
+                        reset_reason = suspend_reason
+                    else:
+                        entry.suspended = False
+                        entry.suspend_reason = None
+                        entry.resume_notice_reason = suspend_reason
+                        entry.updated_at = now
+                        self._save()
+                        return entry
                 else:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
@@ -786,29 +825,47 @@ class SessionStore:
                     entry.last_prompt_tokens = last_prompt_tokens
                 self._save()
 
-    def suspend_session(self, session_key: str) -> bool:
-        """Mark a session as suspended so it auto-resets on next access.
+    def suspend_session(
+        self,
+        session_key: str,
+        reason: str = SUSPEND_REASON_MANUAL_STOP,
+    ) -> bool:
+        """Mark a session as suspended with an explicit reason.
 
-        Used by ``/stop`` to prevent stuck sessions from being resumed
-        after a gateway restart (#7536).  Returns True if the session
-        existed and was marked.
+        Used by ``/stop`` and stuck-loop detection to force a fresh session
+        on next access. Returns True if the session existed and was marked.
         """
         with self._lock:
             self._ensure_loaded_locked()
             if session_key in self._entries:
                 self._entries[session_key].suspended = True
+                self._entries[session_key].suspend_reason = reason
                 self._save()
                 return True
         return False
 
-    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark recently-active sessions as suspended.
+    def clear_resume_notice(self, session_key: str) -> bool:
+        """Clear a one-shot resume notice after it has been surfaced once."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            if session_key in self._entries and self._entries[session_key].resume_notice_reason:
+                self._entries[session_key].resume_notice_reason = None
+                self._save()
+                return True
+        return False
+
+    def suspend_recently_active(
+        self,
+        max_age_seconds: int = 120,
+        reason: str = SUSPEND_REASON_INTERRUPTED_RESTART,
+    ) -> int:
+        """Mark recently-active sessions as interrupted from the previous run.
 
         Called on gateway startup to prevent sessions that were likely
         in-flight when the gateway last exited from being blindly resumed
-        (#7536).  Only suspends sessions updated within *max_age_seconds*
-        to avoid resetting long-idle sessions that are harmless to resume.
-        Returns the number of sessions that were suspended.
+        (#7536). Only marks sessions updated within *max_age_seconds* to avoid
+        touching long-idle sessions that are harmless to resume. Interrupted
+        sessions keep their history; the next access surfaces a resume notice.
         """
         from datetime import timedelta
 
@@ -819,6 +876,7 @@ class SessionStore:
             for entry in self._entries.values():
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.suspended = True
+                    entry.suspend_reason = reason
                     count += 1
             if count:
                 self._save()

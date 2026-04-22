@@ -11,6 +11,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from gateway.session import (
+    SUSPEND_REASON_INTERRUPTED_RESTART,
+    SUSPEND_REASON_STUCK_LOOP,
+)
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
@@ -58,12 +62,14 @@ class TestStuckLoopDetection:
         # Create a mock session entry
         mock_entry = MagicMock()
         mock_entry.suspended = False
+        mock_entry.suspend_reason = None
         runner.session_store._entries = {"session:a": mock_entry}
         runner.session_store._save = MagicMock()
 
         suspended = runner._suspend_stuck_loop_sessions()
         assert suspended == 1
         assert mock_entry.suspended is True
+        assert mock_entry.suspend_reason == SUSPEND_REASON_STUCK_LOOP
 
     def test_no_suspend_below_threshold(self, runner_with_home):
         runner, home = runner_with_home
@@ -73,6 +79,7 @@ class TestStuckLoopDetection:
 
         mock_entry = MagicMock()
         mock_entry.suspended = False
+        mock_entry.suspend_reason = None
         runner.session_store._entries = {"session:a": mock_entry}
 
         suspended = runner._suspend_stuck_loop_sessions()
@@ -102,11 +109,27 @@ class TestStuckLoopDetection:
 
         mock_entry = MagicMock()
         mock_entry.suspended = False
+        mock_entry.suspend_reason = None
         runner.session_store._entries = {"session:a": mock_entry}
         runner.session_store._save = MagicMock()
 
         runner._suspend_stuck_loop_sessions()
         assert not (home / runner._STUCK_LOOP_FILE).exists()
+
+    def test_promotes_interrupted_restart_to_stuck_loop(self, runner_with_home):
+        runner, home = runner_with_home
+        for _ in range(3):
+            runner._increment_restart_failure_counts({"session:a"})
+
+        mock_entry = MagicMock()
+        mock_entry.suspended = True
+        mock_entry.suspend_reason = SUSPEND_REASON_INTERRUPTED_RESTART
+        runner.session_store._entries = {"session:a": mock_entry}
+        runner.session_store._save = MagicMock()
+
+        suspended = runner._suspend_stuck_loop_sessions()
+        assert suspended == 1
+        assert mock_entry.suspend_reason == SUSPEND_REASON_STUCK_LOOP
 
     def test_no_file_no_crash(self, runner_with_home):
         runner, home = runner_with_home

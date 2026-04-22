@@ -89,6 +89,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
 BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
+DEFAULT_SESSION_PAUSE_SECONDS = 60 * 60
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
 MEDIA_IMAGE = 1
@@ -113,6 +114,80 @@ _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+_PAUSED_WEIXIN_SESSIONS: Dict[str, Tuple[float, str]] = {}
+
+
+class WeixinApiError(RuntimeError):
+    """iLink returned a business-level error payload."""
+
+    def __init__(self, endpoint: str, *, ret: Any, errcode: Any, errmsg: str):
+        self.endpoint = endpoint
+        self.ret = ret
+        self.errcode = errcode
+        self.errmsg = errmsg
+        detail = errmsg or "unknown error"
+        super().__init__(f"iLink {endpoint} failed ret={ret} errcode={errcode}: {detail}")
+
+
+class WeixinSessionExpiredError(WeixinApiError):
+    """iLink reported that the Weixin login session expired."""
+
+
+class WeixinSessionPausedError(RuntimeError):
+    """Outbound requests are paused after the account reports session expiry."""
+
+    def __init__(self, account_id: str, until_ts: float, reason: str):
+        self.account_id = account_id
+        self.until_ts = until_ts
+        self.reason = reason
+        remaining_seconds = max(0.0, until_ts - time.time())
+        remaining_minutes = max(1, int((remaining_seconds + 59) // 60))
+        super().__init__(
+            "微信登录态已过期，当前账号已暂停请求，请重新扫码登录后再试"
+            f"（剩余约 {remaining_minutes} 分钟）"
+        )
+
+
+def _get_paused_session(account_id: str) -> Optional[Tuple[float, str]]:
+    if not account_id:
+        return None
+    entry = _PAUSED_WEIXIN_SESSIONS.get(account_id)
+    if not entry:
+        return None
+    until_ts, reason = entry
+    if time.time() >= until_ts:
+        _PAUSED_WEIXIN_SESSIONS.pop(account_id, None)
+        return None
+    return entry
+
+
+def _clear_session_pause(account_id: str) -> None:
+    if account_id:
+        _PAUSED_WEIXIN_SESSIONS.pop(account_id, None)
+
+
+def _pause_session(account_id: str, *, pause_seconds: float, reason: str) -> float:
+    if not account_id:
+        return max(0.0, float(pause_seconds))
+    now = time.time()
+    current = _get_paused_session(account_id)
+    until_ts = max(
+        (current[0] if current else 0.0),
+        now + max(1.0, float(pause_seconds)),
+    )
+    _PAUSED_WEIXIN_SESSIONS[account_id] = (until_ts, reason)
+    return max(0.0, until_ts - now)
+
+
+def _raise_for_business_error(endpoint: str, payload: Dict[str, Any]) -> None:
+    ret = payload.get("ret", 0)
+    errcode = payload.get("errcode", 0)
+    if ret in (0, None) and errcode in (0, None):
+        return
+    errmsg = str(payload.get("errmsg") or "")
+    exc_type = WeixinSessionExpiredError if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE else WeixinApiError
+    raise exc_type(endpoint, ret=ret, errcode=errcode, errmsg=errmsg)
 
 
 def check_weixin_requirements() -> bool:
@@ -337,6 +412,7 @@ async def _api_post(
     payload: Dict[str, Any],
     token: Optional[str],
     timeout_ms: int,
+    allow_business_error: bool = False,
 ) -> Dict[str, Any]:
     body = _json_dumps({**payload, "base_info": _base_info()})
     url = f"{base_url.rstrip('/')}/{endpoint}"
@@ -345,7 +421,10 @@ async def _api_post(
         raw = await response.text()
         if not response.ok:
             raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+        data = json.loads(raw)
+        if not allow_business_error:
+            _raise_for_business_error(endpoint, data)
+        return data
 
 
 async def _api_get(
@@ -384,6 +463,7 @@ async def _get_updates(
             payload={"get_updates_buf": sync_buf},
             token=token,
             timeout_ms=timeout_ms,
+            allow_business_error=True,
         )
     except asyncio.TimeoutError:
         return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
@@ -1030,6 +1110,7 @@ async def qr_login(
                     base_url=base_url,
                     user_id=user_id,
                 )
+                _clear_session_pause(account_id)
                 print(f"\n微信连接成功，account_id={account_id}")
                 return {
                     "account_id": account_id,
@@ -1079,6 +1160,13 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
+        raw_session_pause_seconds = extra.get("session_pause_seconds")
+        if raw_session_pause_seconds is None:
+            raw_session_pause_seconds = os.getenv("WEIXIN_SESSION_PAUSE_SECONDS", str(DEFAULT_SESSION_PAUSE_SECONDS))
+        try:
+            self._session_pause_seconds = max(1.0, float(raw_session_pause_seconds))
+        except (TypeError, ValueError):
+            self._session_pause_seconds = float(DEFAULT_SESSION_PAUSE_SECONDS)
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1111,6 +1199,34 @@ class WeixinAdapter(BasePlatformAdapter):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
 
+    def _pause_session(self, reason: str) -> float:
+        paused_for = _pause_session(
+            self._account_id,
+            pause_seconds=self._session_pause_seconds,
+            reason=reason,
+        )
+        logger.error(
+            "[%s] %s; pausing all requests for %d minute(s)",
+            self.name,
+            reason,
+            max(1, int((paused_for + 59) // 60)),
+        )
+        return paused_for
+
+    def _assert_session_active(self) -> None:
+        entry = _get_paused_session(self._account_id)
+        if not entry:
+            return
+        until_ts, reason = entry
+        raise WeixinSessionPausedError(self._account_id, until_ts, reason)
+
+    def _current_pause_error(self) -> WeixinSessionPausedError:
+        entry = _get_paused_session(self._account_id)
+        if entry:
+            return WeixinSessionPausedError(self._account_id, entry[0], entry[1])
+        synthetic_until = time.time() + self._session_pause_seconds
+        return WeixinSessionPausedError(self._account_id or "unknown", synthetic_until, "session paused")
+
     async def connect(self) -> bool:
         if not check_weixin_requirements():
             message = "微信服务启动失败：缺少依赖库 aiohttp / cryptography，请重装虾手"
@@ -1134,6 +1250,7 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
+        _clear_session_pause(self._account_id)
         self._session = aiohttp.ClientSession(trust_env=True)
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
@@ -1162,8 +1279,13 @@ class WeixinAdapter(BasePlatformAdapter):
         sync_buf = _load_sync_buf(self._hermes_home, self._account_id)
         timeout_ms = LONG_POLL_TIMEOUT_MS
         consecutive_failures = 0
+        pause_poll_interval_seconds = min(RETRY_DELAY_SECONDS, 5)
 
         while self._running:
+            paused = _get_paused_session(self._account_id)
+            if paused:
+                await asyncio.sleep(min(max(0.0, paused[0] - time.time()), pause_poll_interval_seconds))
+                continue
             try:
                 response = await _get_updates(
                     self._session,
@@ -1180,8 +1302,9 @@ class WeixinAdapter(BasePlatformAdapter):
                 errcode = response.get("errcode", 0)
                 if ret not in (0, None) or errcode not in (0, None):
                     if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
-                        logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
-                        await asyncio.sleep(600)
+                        self._pause_session(
+                            f"getUpdates reported expired session (errmsg={response.get('errmsg', '') or 'n/a'})"
+                        )
                         consecutive_failures = 0
                         continue
                     consecutive_failures += 1
@@ -1387,6 +1510,11 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _maybe_fetch_typing_ticket(self, user_id: str, context_token: Optional[str]) -> None:
         if not self._session or not self._token:
             return
+        try:
+            self._assert_session_active()
+        except WeixinSessionPausedError as exc:
+            logger.debug("[%s] getConfig skipped for %s: %s", self.name, _safe_id(user_id), exc)
+            return
         if self._typing_cache.get(user_id):
             return
         try:
@@ -1400,6 +1528,8 @@ class WeixinAdapter(BasePlatformAdapter):
             typing_ticket = str(response.get("typing_ticket") or "")
             if typing_ticket:
                 self._typing_cache.set(user_id, typing_ticket)
+        except WeixinSessionExpiredError as exc:
+            self._pause_session(f"{exc.endpoint} reported expired session during getConfig")
         except Exception as exc:
             logger.debug("[%s] getConfig failed for %s: %s", self.name, _safe_id(user_id), exc)
 
@@ -1417,6 +1547,7 @@ class WeixinAdapter(BasePlatformAdapter):
         client_id: str,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff."""
+        self._assert_session_active()
         last_error: Optional[Exception] = None
         for attempt in range(self._send_chunk_retries + 1):
             try:
@@ -1430,6 +1561,9 @@ class WeixinAdapter(BasePlatformAdapter):
                     client_id=client_id,
                 )
                 return
+            except WeixinSessionExpiredError as exc:
+                self._pause_session(f"{exc.endpoint} reported expired session during sendMessage")
+                raise self._current_pause_error() from exc
             except Exception as exc:
                 last_error = exc
                 if attempt >= self._send_chunk_retries:
@@ -1461,6 +1595,7 @@ class WeixinAdapter(BasePlatformAdapter):
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
         try:
+            self._assert_session_active()
             chunks = [c for c in self._split_text(self.format_message(content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
@@ -1481,6 +1616,11 @@ class WeixinAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._session or not self._token:
             return
+        try:
+            self._assert_session_active()
+        except WeixinSessionPausedError as exc:
+            logger.debug("[%s] typing start skipped for %s: %s", self.name, _safe_id(chat_id), exc)
+            return
         typing_ticket = self._typing_cache.get(chat_id)
         if not typing_ticket:
             return
@@ -1493,11 +1633,18 @@ class WeixinAdapter(BasePlatformAdapter):
                 typing_ticket=typing_ticket,
                 status=TYPING_START,
             )
+        except WeixinSessionExpiredError as exc:
+            self._pause_session(f"{exc.endpoint} reported expired session during sendTyping")
         except Exception as exc:
             logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), exc)
 
     async def stop_typing(self, chat_id: str) -> None:
         if not self._session or not self._token:
+            return
+        try:
+            self._assert_session_active()
+        except WeixinSessionPausedError as exc:
+            logger.debug("[%s] typing stop skipped for %s: %s", self.name, _safe_id(chat_id), exc)
             return
         typing_ticket = self._typing_cache.get(chat_id)
         if not typing_ticket:
@@ -1511,6 +1658,8 @@ class WeixinAdapter(BasePlatformAdapter):
                 typing_ticket=typing_ticket,
                 status=TYPING_STOP,
             )
+        except WeixinSessionExpiredError as exc:
+            self._pause_session(f"{exc.endpoint} reported expired session during sendTyping")
         except Exception as exc:
             logger.debug("[%s] typing stop failed for %s: %s", self.name, _safe_id(chat_id), exc)
 
@@ -1559,6 +1708,7 @@ class WeixinAdapter(BasePlatformAdapter):
         if not self._session or not self._token:
             return SendResult(success=False, error="Not connected")
         try:
+            self._assert_session_active()
             message_id = await self._send_file(chat_id, file_path, caption)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -1576,6 +1726,7 @@ class WeixinAdapter(BasePlatformAdapter):
         if not self._session or not self._token:
             return SendResult(success=False, error="Not connected")
         try:
+            self._assert_session_active()
             message_id = await self._send_file(chat_id, video_path, caption or "")
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -1609,91 +1760,96 @@ class WeixinAdapter(BasePlatformAdapter):
 
     async def _send_file(self, chat_id: str, path: str, caption: str) -> str:
         assert self._session is not None and self._token is not None
+        self._assert_session_active()
         plaintext = Path(path).read_bytes()
         media_type, item_builder = self._outbound_media_builder(path)
         filekey = secrets.token_hex(16)
         aes_key = secrets.token_bytes(16)
         rawsize = len(plaintext)
         rawfilemd5 = hashlib.md5(plaintext).hexdigest()
-        upload_response = await _get_upload_url(
-            self._session,
-            base_url=self._base_url,
-            token=self._token,
-            to_user_id=chat_id,
-            media_type=media_type,
-            filekey=filekey,
-            rawsize=rawsize,
-            rawfilemd5=rawfilemd5,
-            filesize=_aes_padded_size(rawsize),
-            aeskey_hex=aes_key.hex(),
-        )
-        upload_param = str(upload_response.get("upload_param") or "")
-        upload_full_url = str(upload_response.get("upload_full_url") or "")
-        ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
-
-        # Prefer upload_full_url (direct CDN), fall back to constructed CDN URL
-        # from upload_param.  Both paths use POST — the old PUT for
-        # upload_full_url caused 404s on the WeChat CDN.
-        if upload_full_url:
-            upload_url = upload_full_url
-        elif upload_param:
-            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
-        else:
-            raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
-
-        encrypted_query_param = await _upload_ciphertext(
-            self._session,
-            ciphertext=ciphertext,
-            upload_url=upload_url,
-        )
-
-        context_token = self._token_store.get(self._account_id, chat_id)
-        # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
-        # Sending base64(raw_bytes) causes images to show as grey boxes on the
-        # receiver side because the decryption key doesn't match.
-        aes_key_for_api = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
-        media_item = item_builder(
-            encrypt_query_param=encrypted_query_param,
-            aes_key_for_api=aes_key_for_api,
-            ciphertext_size=len(ciphertext),
-            plaintext_size=rawsize,
-            filename=Path(path).name,
-            rawfilemd5=rawfilemd5,
-        )
-
-        last_message_id = None
-        if caption:
-            last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-            await _send_message(
+        try:
+            upload_response = await _get_upload_url(
                 self._session,
                 base_url=self._base_url,
                 token=self._token,
-                to=chat_id,
-                text=self.format_message(caption),
-                context_token=context_token,
-                client_id=last_message_id,
+                to_user_id=chat_id,
+                media_type=media_type,
+                filekey=filekey,
+                rawsize=rawsize,
+                rawfilemd5=rawfilemd5,
+                filesize=_aes_padded_size(rawsize),
+                aeskey_hex=aes_key.hex(),
+            )
+            upload_param = str(upload_response.get("upload_param") or "")
+            upload_full_url = str(upload_response.get("upload_full_url") or "")
+            ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
+
+            # Prefer upload_full_url (direct CDN), fall back to constructed CDN URL
+            # from upload_param.  Both paths use POST — the old PUT for
+            # upload_full_url caused 404s on the WeChat CDN.
+            if upload_full_url:
+                upload_url = upload_full_url
+            elif upload_param:
+                upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
+            else:
+                raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
+
+            encrypted_query_param = await _upload_ciphertext(
+                self._session,
+                ciphertext=ciphertext,
+                upload_url=upload_url,
             )
 
-        last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
-            self._session,
-            base_url=self._base_url,
-            endpoint=EP_SEND_MESSAGE,
-            payload={
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": chat_id,
-                    "client_id": last_message_id,
-                    "message_type": MSG_TYPE_BOT,
-                    "message_state": MSG_STATE_FINISH,
-                    "item_list": [media_item],
-                    **({"context_token": context_token} if context_token else {}),
-                }
-            },
-            token=self._token,
-            timeout_ms=API_TIMEOUT_MS,
-        )
-        return last_message_id
+            context_token = self._token_store.get(self._account_id, chat_id)
+            # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
+            # Sending base64(raw_bytes) causes images to show as grey boxes on the
+            # receiver side because the decryption key doesn't match.
+            aes_key_for_api = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
+            media_item = item_builder(
+                encrypt_query_param=encrypted_query_param,
+                aes_key_for_api=aes_key_for_api,
+                ciphertext_size=len(ciphertext),
+                plaintext_size=rawsize,
+                filename=Path(path).name,
+                rawfilemd5=rawfilemd5,
+            )
+
+            last_message_id = None
+            if caption:
+                last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+                await _send_message(
+                    self._session,
+                    base_url=self._base_url,
+                    token=self._token,
+                    to=chat_id,
+                    text=self.format_message(caption),
+                    context_token=context_token,
+                    client_id=last_message_id,
+                )
+
+            last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            await _api_post(
+                self._session,
+                base_url=self._base_url,
+                endpoint=EP_SEND_MESSAGE,
+                payload={
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": chat_id,
+                        "client_id": last_message_id,
+                        "message_type": MSG_TYPE_BOT,
+                        "message_state": MSG_STATE_FINISH,
+                        "item_list": [media_item],
+                        **({"context_token": context_token} if context_token else {}),
+                    }
+                },
+                token=self._token,
+                timeout_ms=API_TIMEOUT_MS,
+            )
+            return last_message_id
+        except WeixinSessionExpiredError as exc:
+            self._pause_session(f"{exc.endpoint} reported expired session during media send")
+            raise self._current_pause_error() from exc
 
     def _outbound_media_builder(self, path: str):
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"

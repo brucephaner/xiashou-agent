@@ -4,7 +4,8 @@ When the gateway shuts down gracefully (hermes update, gateway restart, /restart
 it writes a .clean_shutdown marker.  On the next startup, if the marker exists,
 suspend_recently_active() is skipped so users don't lose their sessions.
 
-After a crash (no marker), suspension still fires as a safety net for stuck sessions.
+After a crash (no marker), interruption marking still fires as a safety net so
+the next message can warn the user without wiping history.
 """
 
 import os
@@ -15,7 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, SessionResetPolicy
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SUSPEND_REASON_INTERRUPTED_RESTART,
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +55,12 @@ class TestSuspendRecentlyActive:
         count = store.suspend_recently_active()
         assert count == 1
 
-        # Re-fetch — should be suspended now
+        # Re-fetch — should keep the same session and surface a resume notice
         refreshed = store.get_or_create_session(source)
-        assert refreshed.was_auto_reset
+        assert refreshed.was_auto_reset is False
+        assert refreshed.session_id == entry.session_id
+        assert refreshed.resume_notice_reason == SUSPEND_REASON_INTERRUPTED_RESTART
+        assert refreshed.suspended is False
 
     def test_does_not_suspend_old_sessions(self, tmp_path):
         store = _make_store(tmp_path)
@@ -75,10 +84,12 @@ class TestSuspendRecentlyActive:
         count1 = store.suspend_recently_active()
         assert count1 == 1
 
-        # Create a new session (the old one got reset on next access)
+        # Fetch again — the session should resume with the same session_id.
         entry2 = store.get_or_create_session(source)
+        assert entry2.session_id == entry.session_id
+        assert entry2.resume_notice_reason == SUSPEND_REASON_INTERRUPTED_RESTART
 
-        # Suspend again — the new session is recent but not yet suspended
+        # Suspend again — the resumed session is recent and can be marked again
         count2 = store.suspend_recently_active()
         assert count2 == 1
 

@@ -80,6 +80,20 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Interrupt current work | `Ctrl+C` or send a new message | `/stop` or send a new message |
 | Platform-specific status | `/platforms` | `/status`, `/sethome` |
 
+### Messaging session recovery
+
+Gateway session recovery is now reason-aware instead of treating every
+interruption like a full reset:
+
+- `/stop` still hard-stops the current run and the next message starts fresh.
+- An unexpected gateway restart keeps the prior conversation history and shows
+  a one-shot notice so the user can continue without losing context.
+- Sessions that look stuck across repeated restarts are still auto-reset on the
+  next message to break the loop safely.
+
+See [Gateway Session Recovery Spec](docs/specs/gateway-session-recovery.md) for
+the exact suspend reasons and gateway behavior.
+
 For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
 
 ---

@@ -401,6 +401,9 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    SUSPEND_REASON_INTERRUPTED_RESTART,
+    SUSPEND_REASON_MANUAL_STOP,
+    SUSPEND_REASON_STUCK_LOOP,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
@@ -1845,8 +1848,9 @@ class GatewayRunner:
         for session_key in stuck_keys:
             try:
                 entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
+                if entry and entry.suspend_reason != SUSPEND_REASON_STUCK_LOOP:
                     entry.suspended = True
+                    entry.suspend_reason = SUSPEND_REASON_STUCK_LOOP
                     suspended += 1
                     logger.warning(
                         "Auto-suspended stuck session %s (active across %d "
@@ -2030,7 +2034,10 @@ class GatewayRunner:
             try:
                 suspended = self.session_store.suspend_recently_active()
                 if suspended:
-                    logger.info("Suspended %d in-flight session(s) from previous run", suspended)
+                    logger.info(
+                        "Marked %d in-flight session(s) as interrupted from previous run",
+                        suspended,
+                    )
             except Exception as e:
                 logger.warning("Session suspension on startup failed: %s", e)
 
@@ -3062,8 +3069,14 @@ class GatewayRunner:
                     del self._running_agents[_quick_key]
                 # Mark session suspended so the next message starts fresh
                 # instead of resuming the stuck context (#7536).
-                self.session_store.suspend_session(_quick_key)
-                logger.info("HARD STOP for session %s — suspended, session lock released", _quick_key[:20])
+                self.session_store.suspend_session(
+                    _quick_key,
+                    reason=SUSPEND_REASON_MANUAL_STOP,
+                )
+                logger.info(
+                    "HARD STOP for session %s — fresh-start flagged, session lock released",
+                    _quick_key[:20],
+                )
                 return "⚡ 已强制停止。会话已挂起 — 下条消息将开始新会话。"
 
             # /reset and /new must bypass the running-agent guard so they
@@ -3685,12 +3698,45 @@ class GatewayRunner:
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         
+        resume_notice_reason = getattr(session_entry, 'resume_notice_reason', None)
+        if resume_notice_reason == SUSPEND_REASON_INTERRUPTED_RESTART:
+            context_note = (
+                "[System note: The previous gateway run was interrupted unexpectedly. "
+                "Continue the existing conversation; prior context is preserved, "
+                "but the previous turn may have ended mid-response.]"
+            )
+            context_prompt = context_note + "\n\n" + context_prompt
+            try:
+                policy = self.session_store.config.get_reset_policy(
+                    platform=source.platform,
+                    session_type=getattr(source, 'chat_type', 'dm'),
+                )
+                platform_name = source.platform.value if source.platform else ""
+                should_notify = (
+                    policy.notify
+                    and platform_name not in policy.notify_exclude_platforms
+                )
+                if should_notify:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        notice = (
+                            "◐ 上次会话被中断，已保留之前的对话历史。\n"
+                            "你可以继续当前会话；如果想从头开始，使用 /reset（/重置）。"
+                        )
+                        await adapter.send_message(source, notice)
+            except Exception as e:
+                logger.debug("Failed to send interrupted-session notice: %s", e)
+            finally:
+                self.session_store.clear_resume_notice(session_entry.session_key)
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "suspended":
-                context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
+            if reset_reason == SUSPEND_REASON_MANUAL_STOP:
+                context_note = "[System note: The user's previous session was manually stopped. This is a fresh conversation with no prior context.]"
+            elif reset_reason == SUSPEND_REASON_STUCK_LOOP:
+                context_note = "[System note: The user's previous session appeared stuck across repeated restarts, so it was reset automatically. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
@@ -3708,9 +3754,10 @@ class GatewayRunner:
                 )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended sessions always notify (they were explicitly stopped
-                # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
+                should_notify = reset_reason in (
+                    SUSPEND_REASON_MANUAL_STOP,
+                    SUSPEND_REASON_STUCK_LOOP,
+                ) or (
                     policy.notify
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
@@ -3718,8 +3765,10 @@ class GatewayRunner:
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "上次会话被中止"
+                        if reset_reason == SUSPEND_REASON_MANUAL_STOP:
+                            reason_text = "上次会话已手动停止"
+                        elif reset_reason == SUSPEND_REASON_STUCK_LOOP:
+                            reason_text = "上次会话疑似卡住，已自动重置"
                         elif reset_reason == "daily":
                             reason_text = f"每日 {policy.at_hour}:00 定时重置"
                         else:
@@ -4734,8 +4783,14 @@ class GatewayRunner:
             # Force-clean the sentinel so the session is unlocked.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
-            self.session_store.suspend_session(session_key)
-            logger.info("HARD STOP (pending) for session %s — suspended, sentinel cleared", session_key[:20])
+            self.session_store.suspend_session(
+                session_key,
+                reason=SUSPEND_REASON_MANUAL_STOP,
+            )
+            logger.info(
+                "HARD STOP (pending) for session %s — fresh-start flagged, sentinel cleared",
+                session_key[:20],
+            )
             return "⚡ 已强制停止。代理还在启动中 — 下条消息将开始新会话。"
         if agent:
             agent.interrupt("Stop requested")

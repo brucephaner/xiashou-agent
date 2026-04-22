@@ -363,6 +363,107 @@ class TestWeixinChunkDelivery:
         assert first_try["client_id"] == retry["client_id"]
 
 
+class TestWeixinSessionGuard:
+    def _connected_adapter(self, account_id: str) -> WeixinAdapter:
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._account_id = account_id
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        return adapter
+
+    def test_raise_for_business_error_raises_session_expired(self):
+        import pytest
+
+        with pytest.raises(weixin.WeixinSessionExpiredError):
+            weixin._raise_for_business_error(
+                weixin.EP_SEND_MESSAGE,
+                {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "expired"},
+            )
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_returns_paused_error_without_hitting_api(self, send_message_mock):
+        account_id = "acct-paused-send"
+        adapter = self._connected_adapter(account_id)
+        weixin._clear_session_pause(account_id)
+        try:
+            weixin._pause_session(
+                account_id,
+                pause_seconds=300,
+                reason="session expired",
+            )
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+            assert result.success is False
+            assert "已暂停请求" in result.error
+            send_message_mock.assert_not_awaited()
+        finally:
+            weixin._clear_session_pause(account_id)
+
+    @patch("gateway.platforms.weixin._get_upload_url", new_callable=AsyncMock)
+    def test_send_document_returns_paused_error_without_upload(self, get_upload_url_mock, tmp_path):
+        account_id = "acct-paused-file"
+        adapter = self._connected_adapter(account_id)
+        file_path = tmp_path / "demo.txt"
+        file_path.write_text("hello", encoding="utf-8")
+        weixin._clear_session_pause(account_id)
+        try:
+            weixin._pause_session(
+                account_id,
+                pause_seconds=300,
+                reason="session expired",
+            )
+            result = asyncio.run(adapter.send_document("wxid_test123", str(file_path)))
+            assert result.success is False
+            assert "已暂停请求" in result.error
+            get_upload_url_mock.assert_not_awaited()
+        finally:
+            weixin._clear_session_pause(account_id)
+
+    @patch("gateway.platforms.weixin._send_typing", new_callable=AsyncMock)
+    def test_send_typing_skips_api_when_session_paused(self, send_typing_mock):
+        account_id = "acct-paused-typing"
+        adapter = self._connected_adapter(account_id)
+        adapter._typing_cache.set("wxid_test123", "typing-ticket")
+        weixin._clear_session_pause(account_id)
+        try:
+            weixin._pause_session(
+                account_id,
+                pause_seconds=300,
+                reason="session expired",
+            )
+            asyncio.run(adapter.send_typing("wxid_test123"))
+            send_typing_mock.assert_not_awaited()
+        finally:
+            weixin._clear_session_pause(account_id)
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._get_updates", new_callable=AsyncMock)
+    def test_poll_loop_pauses_requests_after_session_expired(self, get_updates_mock, sleep_mock):
+        account_id = "acct-poll-expired"
+        adapter = self._connected_adapter(account_id)
+        adapter._session_pause_seconds = 37
+        adapter._running = True
+        weixin._clear_session_pause(account_id)
+
+        async def fake_get_updates(*args, **kwargs):
+            return {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "expired"}
+
+        async def fake_sleep(seconds):
+            adapter._running = False
+
+        get_updates_mock.side_effect = fake_get_updates
+        sleep_mock.side_effect = fake_sleep
+
+        try:
+            asyncio.run(adapter._poll_loop())
+            paused = weixin._get_paused_session(account_id)
+            assert paused is not None
+            assert sleep_mock.await_args_list[0].args[0] == min(weixin.RETRY_DELAY_SECONDS, 5)
+        finally:
+            weixin._clear_session_pause(account_id)
+
+
 class TestWeixinRemoteMediaSafety:
     def test_download_remote_media_blocks_unsafe_urls(self):
         adapter = _make_adapter()
