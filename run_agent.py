@@ -9107,7 +9107,7 @@ class AIAgent:
                                 self._persist_session(messages, conversation_history)
                                 self.clear_interrupt()
                                 return {
-                                    "final_response": f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries}).",
+                                    "final_response": f"操作已中断：重试等待过程中被打断（{_failure_hint}，第 {retry_count}/{max_retries} 次）。",
                                     "messages": messages,
                                     "api_calls": api_call_count,
                                     "completed": False,
@@ -9462,7 +9462,7 @@ class AIAgent:
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
                     self._persist_session(messages, conversation_history)
                     interrupted = True
-                    final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
+                    final_response = f"操作已中断：刚才在等模型回复（已等待 {api_elapsed:.1f} 秒）。"
                     break
 
                 except Exception as api_error:
@@ -9767,7 +9767,7 @@ class AIAgent:
                         self._persist_session(messages, conversation_history)
                         self.clear_interrupt()
                         return {
-                            "final_response": f"Operation interrupted: handling API error ({error_type}: {self._clean_error_message(str(api_error))}).",
+                            "final_response": f"操作已中断：刚才在处理 API 错误（{error_type}：{self._clean_error_message(str(api_error))}）。",
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
@@ -10280,7 +10280,7 @@ class AIAgent:
                             self._persist_session(messages, conversation_history)
                             self.clear_interrupt()
                             return {
-                                "final_response": f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
+                                "final_response": f"操作已中断：出错后准备重试时被打断（第 {retry_count}/{max_retries} 次）。",
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
