@@ -716,6 +716,22 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+_REFRESH_FALLBACK_PROVIDER: Dict[str, str] = {
+    "name": "wokey.ai",
+    "display_name": "wokey.ai",
+    "base_url": "https://api.wokey.ai/messages",
+    "api_mode": "anthropic_messages",
+    "model": "zhipu:glm-5.1",
+}
+_REFRESH_BACKEND_ACTIVE_KEY_TIMEOUT_S = 10.0
+_REFRESH_KEY_PROBE_ATTEMPTS = 3
+_REFRESH_KEY_PROBE_RETRY_DELAY_S = 1.5
+
+
+def _refresh_backend_base_url() -> str:
+    return os.environ.get("DAOLING_BACKEND_BASE_URL", "https://shouxia.ai").rstrip("/")
+
+
 def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
@@ -1899,12 +1915,183 @@ class GatewayRunner:
         import shutil
         import subprocess
 
+        if os.name == "nt":
+            import os as stdlib_os
+
+            current_pid = os.getpid()
+            python_exe = Path(sys.executable).resolve()
+            runtime_candidates = []
+            managed_runtime = _hermes_home.parent / "runtime"
+            if managed_runtime.exists():
+                runtime_candidates.append(managed_runtime)
+            local_runtime = _hermes_home / "runtime"
+            if local_runtime.exists():
+                runtime_candidates.append(local_runtime)
+            exe_parent = python_exe.parent
+            if exe_parent.name.lower() == "python":
+                runtime_candidates.append(exe_parent.parent)
+            runtime_candidates.append(exe_parent)
+            runtime_candidates.append(exe_parent.parent)
+
+            runtime_root = next(
+                (
+                    candidate
+                    for candidate in runtime_candidates
+                    if (candidate / "python").exists() and (candidate / "agent" / "venv").exists()
+                ),
+                None,
+            )
+            if runtime_root is None:
+                raise FileNotFoundError("runtime root")
+
+            runtime_python = runtime_root / "python"
+            venv_root = runtime_root / "agent" / "venv"
+            venv_scripts = venv_root / "Scripts"
+            agent_root = runtime_root / "agent"
+            venv_python_candidates = [
+                venv_scripts / "python.exe",
+                venv_scripts / "python",
+            ]
+            venv_python = next(
+                (candidate for candidate in venv_python_candidates if candidate.exists()),
+                None,
+            )
+            if venv_python is None:
+                raise FileNotFoundError("venv python")
+
+            helper_candidates = [
+                runtime_python / "pythonw.exe",
+                runtime_python / "python.exe",
+            ]
+            helper_python = next(
+                (candidate for candidate in helper_candidates if candidate.exists()),
+                None,
+            )
+            if helper_python is None:
+                raise FileNotFoundError("runtime helper python")
+
+            managed_value = os.environ.get("HERMES_MANAGED", "")
+            git_bash = runtime_root / "git" / "usr" / "bin" / "bash.exe"
+            helper_path = runtime_root.parent / "start_gateway_hidden.pyw"
+            helper_source = "\n".join(
+                [
+                    "import os",
+                    "import subprocess",
+                    "import time",
+                    "from pathlib import Path",
+                    "",
+                    f"CURRENT_PID = {current_pid}",
+                    f"HERMES_HOME = Path({str(_hermes_home)!r})",
+                    f"RUNTIME_PYTHON = Path({str(runtime_python)!r})",
+                    f"AGENT_ROOT = Path({str(agent_root)!r})",
+                    f"VENV_ROOT = Path({str(venv_root)!r})",
+                    f"VENV_SCRIPTS = Path({str(venv_scripts)!r})",
+                    f"VENV_PYTHON = Path({str(venv_python)!r})",
+                    f"GIT_BASH = Path({str(git_bash)!r})",
+                    f"MANAGED_VALUE = {managed_value!r}",
+                    "LOG_FILE = HERMES_HOME / 'logs' / 'restart-helper.log'",
+                    "",
+                    "def _log(message: str) -> None:",
+                    "    try:",
+                    "        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)",
+                    "        with LOG_FILE.open('a', encoding='utf-8') as fh:",
+                    "            fh.write(f\"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\\n\")",
+                    "    except Exception:",
+                    "        pass",
+                    "",
+                    "def _wait_for_process_exit(pid: int, timeout: float = 15.0) -> None:",
+                    "    try:",
+                    "        import ctypes",
+                    "        kernel32 = ctypes.windll.kernel32",
+                    "        synchronize = 0x00100000",
+                    "        wait_object_0 = 0x00000000",
+                    "        handle = kernel32.OpenProcess(synchronize, False, pid)",
+                    "        if handle:",
+                    "            try:",
+                    "                deadline = time.time() + timeout",
+                    "                while time.time() < deadline:",
+                    "                    result = kernel32.WaitForSingleObject(handle, 200)",
+                    "                    if result == wait_object_0:",
+                    "                        return",
+                    "                return",
+                    "            finally:",
+                    "                kernel32.CloseHandle(handle)",
+                    "    except Exception:",
+                    "        pass",
+                    "    time.sleep(1.0)",
+                    "",
+                    "_log(f'helper started for pid={CURRENT_PID}')",
+                    "_wait_for_process_exit(CURRENT_PID)",
+                    "_log('wait complete, launching replacement gateway')",
+                    "env = dict(os.environ)",
+                    "env['HERMES_HOME'] = str(HERMES_HOME)",
+                    "if MANAGED_VALUE:",
+                    "    env['HERMES_MANAGED'] = MANAGED_VALUE",
+                    "else:",
+                    "    env.pop('HERMES_MANAGED', None)",
+                    "env['PYTHONUNBUFFERED'] = '1'",
+                    "env['PYTHONIOENCODING'] = 'utf-8'",
+                    "env['PYTHONUTF8'] = '1'",
+                    "env['PYTHONPATH'] = ''",
+                    "env['PYTHONSTARTUP'] = ''",
+                    "path_entries = [str(path) for path in (RUNTIME_PYTHON, VENV_SCRIPTS, VENV_ROOT) if path.exists()]",
+                    "existing_path = env.get('PATH', '')",
+                    "if existing_path:",
+                    "    path_entries.append(existing_path)",
+                    "env['PATH'] = ';'.join(path_entries)",
+                    "if GIT_BASH.exists():",
+                    "    env['HERMES_GIT_BASH_PATH'] = str(GIT_BASH)",
+                    "else:",
+                    "    env.pop('HERMES_GIT_BASH_PATH', None)",
+                    "try:",
+                    "    (HERMES_HOME / 'gateway.pid').unlink(missing_ok=True)",
+                    "except Exception:",
+                    "    pass",
+                    "flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)",
+                    "child = subprocess.Popen(",
+                    "    [str(VENV_PYTHON), '-m', 'hermes_cli.main', 'gateway', 'run', '--replace'],",
+                    "    cwd=str(AGENT_ROOT),",
+                    "    env=env,",
+                    "    stdout=subprocess.DEVNULL,",
+                    "    stderr=subprocess.DEVNULL,",
+                    "    stdin=subprocess.DEVNULL,",
+                    "    creationflags=flags,",
+                    ")",
+                    "_log(f'child pid={child.pid}')",
+                    "time.sleep(5.0)",
+                    "_log(f'child poll after 5s={child.poll()}')",
+                    "raise SystemExit(0 if child.poll() is None else int(child.returncode or 0))",
+                    "",
+                ]
+            )
+            helper_path.write_text(helper_source, encoding="utf-8")
+            creationflags = 0
+            for flag_name in (
+                "CREATE_NO_WINDOW",
+                "DETACHED_PROCESS",
+                "CREATE_NEW_PROCESS_GROUP",
+                "CREATE_BREAKAWAY_FROM_JOB",
+            ):
+                creationflags |= getattr(subprocess, flag_name, 0)
+            subprocess.Popen(
+                [str(helper_python), str(helper_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                cwd=str(runtime_root.parent),
+            )
+            return
+
+        current_pid = os.getpid()
+
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
             return
 
-        current_pid = os.getpid()
+        restart_argv = hermes_cmd + ["gateway", "restart"]
+
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
             f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
@@ -3242,6 +3429,9 @@ class GatewayRunner:
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
+
+        if canonical == "refresh":
+            return await self._handle_refresh_command(event)
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
@@ -4843,10 +5033,357 @@ class GatewayRunner:
         try:
             from hermes_cli.config import is_managed
             if is_managed():
-                return "♻ 正在重启网关。如果 60 秒内未收到通知，请重新打开虾手应用。"
+                return "♻ 正在重启网关。重启期间消息不会回复，等收到“网关已重启完成”后再继续。"
         except Exception:
             pass
         return "♻ 正在重启网关。如果 60 秒内未收到通知，请通过终端运行 `hermes gateway restart`。"
+
+    def _collect_refresh_device_info(self) -> Dict[str, Any]:
+        """Collect best-effort device metadata for backend active-key lookup."""
+        import platform
+        import shutil
+        import subprocess
+
+        info: Dict[str, Any] = {
+            "hostname": platform.node() or None,
+            "cpu_cores": os.cpu_count(),
+        }
+        system = platform.system()
+
+        if system == "Windows":
+            info["os_version"] = f"Windows {platform.version()}"
+            try:
+                import winreg
+
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Cryptography",
+                ) as key:
+                    info["hardware_uuid"], _ = winreg.QueryValueEx(key, "MachineGuid")
+            except Exception:
+                pass
+            try:
+                import uuid as _uuid
+
+                mac_int = _uuid.getnode()
+                info["mac_address"] = ":".join(
+                    f"{(mac_int >> (8 * i)) & 0xFF:02x}" for i in range(5, -1, -1)
+                )
+            except Exception:
+                pass
+            info["cpu_model"] = platform.processor() or None
+            try:
+                import ctypes
+
+                mem = ctypes.c_ulonglong(0)
+                ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(mem))  # type: ignore[attr-defined]
+                info["memory_bytes"] = mem.value * 1024
+            except Exception:
+                pass
+            try:
+                disk = shutil.disk_usage("C:\\")
+                info["disk_bytes"] = disk.total
+            except Exception:
+                pass
+        elif system == "Darwin":
+            try:
+                name = subprocess.check_output(
+                    ["sw_vers", "-productName"],
+                    text=True,
+                    timeout=5,
+                ).strip()
+                version = subprocess.check_output(
+                    ["sw_vers", "-productVersion"],
+                    text=True,
+                    timeout=5,
+                ).strip()
+                info["os_version"] = f"{name} {version}"
+            except Exception:
+                info["os_version"] = f"{system} {platform.mac_ver()[0]}"
+
+        return {key: value for key, value in info.items() if value not in (None, "")}
+
+    async def _fetch_backend_active_key(self, user_id: str) -> Optional[Dict[str, str]]:
+        """Fetch the currently assigned backend key for a Weixin user."""
+        import aiohttp
+
+        openid = str(user_id or "").strip()
+        if "@" in openid:
+            openid = openid.split("@", 1)[0]
+        if not openid:
+            return None
+
+        payload: Dict[str, Any] = {"wechat_user_id": openid}
+        device = self._collect_refresh_device_info()
+        if device:
+            payload["device"] = device
+
+        url = f"{_refresh_backend_base_url()}/api/active-key"
+        timeout = aiohttp.ClientTimeout(total=_REFRESH_BACKEND_ACTIVE_KEY_TIMEOUT_S)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.info("refresh active-key lookup returned HTTP %s", resp.status)
+                        return None
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception as exc:
+                        logger.warning("refresh active-key payload parse failed: %s", exc)
+                        return None
+        except asyncio.TimeoutError:
+            logger.info("refresh active-key lookup timed out")
+            return None
+        except Exception as exc:
+            logger.warning("refresh active-key lookup failed: %s", exc)
+            return None
+
+        if not isinstance(data, dict):
+            return None
+        api_key = str(data.get("apiKey") or "").strip()
+        if not api_key:
+            return None
+
+        result: Dict[str, str] = {"api_key": api_key}
+        for backend_key, output_key in (
+            ("baseUrl", "base_url"),
+            ("model", "model"),
+            ("visionModel", "vision_model"),
+        ):
+            value = str(data.get(backend_key) or "").strip()
+            if value:
+                result[output_key] = value
+        return result
+
+    def _apply_refresh_provider_overrides(
+        self,
+        provider: Dict[str, str],
+        backend_result: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Overlay backend provider hints onto the managed desktop defaults."""
+        effective = dict(provider)
+        if backend_result.get("base_url"):
+            effective["base_url"] = backend_result["base_url"]
+        if backend_result.get("model"):
+            effective["model"] = backend_result["model"]
+        if backend_result.get("vision_model"):
+            effective["vision_model"] = backend_result["vision_model"]
+        return effective
+
+    async def _probe_refresh_key(
+        self,
+        provider: Dict[str, str],
+        api_key: str,
+    ) -> tuple[bool, str, bool]:
+        """Probe a backend-provided key before swapping the live config."""
+        import aiohttp
+
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        api_mode = str(provider.get("api_mode") or "").strip()
+        model_name = str(provider.get("model") or "").strip()
+        if not base_url or not api_key or not model_name:
+            return False, "模型配置不完整", False
+
+        if api_mode == "anthropic_messages" or base_url.endswith(("/messages", "/v1/messages")):
+            url = base_url if base_url.endswith(("/messages", "/v1/messages")) else f"{base_url}/messages"
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+        else:
+            url = f"{base_url}/chat/completions"
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        return True, "", False
+                    if resp.status in (401, 403):
+                        return False, "密钥无效或已过期", False
+                    if resp.status == 402:
+                        return False, "账户余额不足", False
+                    if resp.status == 429:
+                        return False, "请求过于频繁，请稍后再试", True
+                    retryable = resp.status >= 500 or resp.status == 408
+                    return False, f"服务器错误 HTTP {resp.status}: {body[:120]}", retryable
+        except asyncio.TimeoutError:
+            return False, "网络超时，请检查网络后重试", True
+        except Exception as exc:
+            return False, f"网络错误: {exc}", True
+
+    async def _probe_refresh_key_with_retry(
+        self,
+        provider: Dict[str, str],
+        api_key: str,
+        *,
+        attempts: int = _REFRESH_KEY_PROBE_ATTEMPTS,
+        retry_delay_s: float = _REFRESH_KEY_PROBE_RETRY_DELAY_S,
+    ) -> tuple[bool, str, bool]:
+        """Retry transient validation failures before rejecting /refresh."""
+        last_reason = "未知错误"
+        last_retryable = False
+        max_attempts = max(1, attempts)
+        for attempt in range(1, max_attempts + 1):
+            ok, reason, retryable = await self._probe_refresh_key(provider, api_key)
+            if ok:
+                return True, "", False
+            last_reason = reason
+            last_retryable = retryable
+            if not retryable or attempt >= max_attempts:
+                break
+            logger.info(
+                "refresh probe transient failure (%s/%s): %s",
+                attempt,
+                max_attempts,
+                reason,
+            )
+            await asyncio.sleep(retry_delay_s * attempt)
+        return False, last_reason, last_retryable
+
+    def _write_refreshed_backend_config(
+        self,
+        provider: Dict[str, str],
+        api_key: str,
+    ) -> None:
+        """Persist refreshed backend credentials into config.yaml atomically."""
+        import yaml
+
+        config_path = _hermes_home / "config.yaml"
+        existing: Dict[str, Any] = {}
+        if config_path.exists():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                existing = loaded
+
+        provider_name = str(provider.get("name") or _REFRESH_FALLBACK_PROVIDER["name"]).strip()
+        model_name = str(provider.get("model") or "").strip()
+        base_url = str(provider.get("base_url") or "").strip()
+        vision_model = str(provider.get("vision_model") or "").strip()
+        api_mode = str(provider.get("api_mode") or "").strip()
+
+        models: List[str] = []
+        for candidate in (model_name, vision_model):
+            if candidate and candidate not in models:
+                models.append(candidate)
+
+        existing["model"] = {
+            "default": model_name,
+            "provider": provider_name,
+        }
+
+        providers_map = existing.get("providers")
+        if not isinstance(providers_map, dict):
+            providers_map = {}
+        provider_entry: Dict[str, Any] = {
+            "name": provider_name,
+            "api": base_url,
+            "api_key": api_key,
+            "default_model": model_name,
+            "models": models or [model_name],
+        }
+        if api_mode:
+            provider_entry["transport"] = api_mode
+        providers_map[provider_name] = provider_entry
+        existing["providers"] = providers_map
+
+        auxiliary = existing.get("auxiliary")
+        if not isinstance(auxiliary, dict):
+            auxiliary = {}
+        vision_cfg = auxiliary.get("vision")
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = {}
+        if vision_model:
+            vision_cfg["provider"] = "main"
+            vision_cfg["model"] = vision_model
+            auxiliary["vision"] = vision_cfg
+        else:
+            vision_cfg.pop("provider", None)
+            vision_cfg.pop("model", None)
+            if vision_cfg:
+                auxiliary["vision"] = vision_cfg
+            else:
+                auxiliary.pop("vision", None)
+        if auxiliary:
+            existing["auxiliary"] = auxiliary
+        else:
+            existing.pop("auxiliary", None)
+
+        existing.setdefault("fallback_providers", [])
+        existing.setdefault("toolsets", ["hermes-cli"])
+        atomic_yaml_write(config_path, existing, sort_keys=False)
+
+    async def _handle_refresh_command(self, event: MessageEvent) -> str:
+        """Handle /refresh by pulling the latest backend key and applying it live."""
+        from hermes_cli.config import is_managed
+
+        if event.source.platform != Platform.WEIXIN:
+            return "✗ `/refresh` 目前只支持微信通道。"
+        if not is_managed():
+            return "✗ `/refresh` 目前只支持桌面版托管环境。"
+        if self._restart_requested or self._draining:
+            return "⏳ 网关正在重启中，请稍后再试 `/refresh`。"
+
+        user_id = str(event.source.user_id or event.source.chat_id or "").strip()
+        if not user_id:
+            return "✗ 无法识别当前微信用户，暂时不能刷新配置。"
+
+        backend_result = await self._fetch_backend_active_key(user_id)
+        if not backend_result:
+            return "✗ 当前未查询到可用模型配置，请稍后再试。"
+
+        effective_provider = self._apply_refresh_provider_overrides(
+            _REFRESH_FALLBACK_PROVIDER,
+            backend_result,
+        )
+        ok, reason, retryable = await self._probe_refresh_key_with_retry(
+            effective_provider,
+            backend_result["api_key"],
+        )
+        if not ok and not retryable:
+            return f"✗ 密钥验证失败：{reason}"
+        if not ok and retryable:
+            logger.warning("refresh probe hit transient failure, accepting config anyway: %s", reason)
+
+        try:
+            self._write_refreshed_backend_config(
+                effective_provider,
+                backend_result["api_key"],
+            )
+        except Exception as exc:
+            logger.exception("refresh failed to persist config")
+            return f"✗ 写入配置失败：{exc}"
+
+        try:
+            self.config = load_gateway_config()
+            self._provider_routing = self._load_provider_routing()
+            session_key = self._session_key_for_source(event.source)
+            self._session_model_overrides.pop(session_key, None)
+        except Exception as exc:
+            logger.debug("Failed to refresh in-memory runtime state after /refresh: %s", exc)
+
+        model_name = str(effective_provider.get("model") or "").strip() or "unknown"
+        active_agents = self._running_agent_count()
+        if active_agents:
+            return f"⏳ 已更新为 {model_name}，当前任务结束后生效。"
+        return f"✅ 已更新为 {model_name}。"
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""

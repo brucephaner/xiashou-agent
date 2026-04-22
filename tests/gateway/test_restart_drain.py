@@ -1,6 +1,9 @@
 import asyncio
+import os
 import shutil
 import subprocess
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,6 +36,26 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
 
     assert result == "⏳ 正在等待 1 个进行中的任务完成后重启..."
     running_agent.interrupt.assert_not_called()
+    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+@pytest.mark.asyncio
+async def test_restart_command_restarts_for_managed_weixin(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED", "daoling")
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/重启",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-managed-restart",
+    )
+    event.source.platform = gateway_run.Platform.WEIXIN
+
+    result = await runner._handle_message(event)
+
+    assert "正在重启网关" in result
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
@@ -161,6 +184,71 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
+async def test_launch_detached_restart_command_uses_helper_launcher_on_windows(
+    tmp_path, monkeypatch
+):
+    runner, _adapter = make_restart_runner()
+    popen_calls = []
+
+    runtime_root = tmp_path / "runtime"
+    python_exe = runtime_root / "python" / "python.exe"
+    helper_python = runtime_root / "python" / "pythonw.exe"
+    venv_python = runtime_root / "agent" / "venv" / "Scripts" / "python.exe"
+    git_bash = runtime_root / "git" / "usr" / "bin" / "bash.exe"
+    python_exe.parent.mkdir(parents=True, exist_ok=True)
+    (runtime_root / "agent" / "venv" / "Scripts").mkdir(parents=True, exist_ok=True)
+    git_bash.parent.mkdir(parents=True, exist_ok=True)
+    python_exe.write_text("", encoding="utf-8")
+    helper_python.write_text("", encoding="utf-8")
+    venv_python.write_text("", encoding="utf-8")
+    git_bash.write_text("", encoding="utf-8")
+
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    gateway_pid = hermes_home / "gateway.pid"
+    gateway_pid.write_text("999", encoding="utf-8")
+
+    fake_os = SimpleNamespace(getpid=lambda: 654, name="nt", environ={"HERMES_MANAGED": "daoling"})
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(gateway_run, "os", fake_os)
+    monkeypatch.setattr(gateway_run.sys, "executable", str(python_exe))
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x8000000, raising=False)
+    monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    monkeypatch.setattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False)
+
+    await runner._launch_detached_restart_command()
+
+    assert len(popen_calls) == 1
+    cmd, kwargs = popen_calls[0]
+    helper_path = tmp_path / "start_gateway_hidden.pyw"
+    helper_source = helper_path.read_text(encoding="utf-8")
+    assert cmd == [str(helper_python), str(helper_path)]
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == 0x8 | 0x200 | 0x01000000 | 0x8000000
+    assert kwargs["cwd"] == str(tmp_path)
+    assert f"CURRENT_PID = 654" in helper_source
+    assert f"HERMES_HOME = Path({str(hermes_home)!r})" in helper_source
+    assert f"RUNTIME_PYTHON = Path({str(runtime_root / 'python')!r})" in helper_source
+    assert f"VENV_PYTHON = Path({str(venv_python)!r})" in helper_source
+    assert f"GIT_BASH = Path({str(git_bash)!r})" in helper_source
+    assert "LOG_FILE = HERMES_HOME / 'logs' / 'restart-helper.log'" in helper_source
+    assert "_log(f'helper started for pid={CURRENT_PID}')" in helper_source
+    assert "'-m', 'hermes_cli.main', 'gateway', 'run', '--replace'" in helper_source
+    assert "(HERMES_HOME / 'gateway.pid').unlink(missing_ok=True)" in helper_source
+    assert "time.sleep(5.0)" in helper_source
 
 
 # ── Shutdown notification tests ──────────────────────────────────────

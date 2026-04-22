@@ -165,11 +165,11 @@ def _scan_environments() -> List[EnvironmentInfo]:
         return environments
     
     for py_file in ENVIRONMENTS_DIR.glob("*.py"):
-        if py_file.name.startswith("_"):
+        if py_file.name.startswith((".", "_")):
             continue
         
         try:
-            with open(py_file, "r") as f:
+            with open(py_file, "r", encoding="utf-8") as f:
                 tree = ast.parse(f.read())
             
             for node in ast.walk(tree):

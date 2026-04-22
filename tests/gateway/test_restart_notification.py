@@ -37,7 +37,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     )
 
     result = await runner._handle_restart_command(event)
-    assert "Restarting" in result
+    assert "重启" in result
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
@@ -135,7 +135,7 @@ async def test_send_restart_notification_delivers_and_cleans_up(tmp_path, monkey
     adapter.send.assert_called_once()
     call_args = adapter.send.call_args
     assert call_args[0][0] == "42"  # chat_id
-    assert "restarted" in call_args[0][1].lower()
+    assert "网关已重启" in call_args[0][1]
     assert call_args[1].get("metadata") is None  # no thread
     assert not notify_path.exists()
 

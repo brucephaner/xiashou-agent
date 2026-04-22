@@ -169,6 +169,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                aliases=("更新",), gateway_only=True),
+    CommandDef("refresh", "从后端重新获取 API 密钥和模型配置", "Configuration",
+               aliases=("刷新", "刷新配置"), gateway_only=True),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info",
                aliases=("诊断",)),
 

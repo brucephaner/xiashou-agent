@@ -25,6 +25,12 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+def _should_skip_module_path(module_path: Path) -> bool:
+    """Return True for metadata sidecars / hidden files that are not real modules."""
+    name = module_path.name
+    return name.startswith(".") or name in {"__init__.py", "registry.py", "mcp_tool.py"}
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -44,10 +50,13 @@ def _module_registers_tools(module_path: Path) -> bool:
     Only inspects module-body statements so that helper modules which happen
     to call ``registry.register()`` inside a function are not picked up.
     """
+    if _should_skip_module_path(module_path):
+        return False
+
     try:
         source = module_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(module_path))
-    except (OSError, SyntaxError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return False
 
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
@@ -59,8 +68,7 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     module_names = [
         f"tools.{path.stem}"
         for path in sorted(tools_path.glob("*.py"))
-        if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
-        and _module_registers_tools(path)
+        if not _should_skip_module_path(path) and _module_registers_tools(path)
     ]
 
     imported: List[str] = []

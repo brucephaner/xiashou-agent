@@ -289,6 +289,14 @@ def remove_pid_file() -> None:
         pass
 
 
+def _remove_stale_pid_file() -> None:
+    """Best-effort removal for PID files already proven stale by probes."""
+    try:
+        _get_pid_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, Any]] = None) -> tuple[bool, Optional[dict[str, Any]]]:
     """Acquire a machine-local lock keyed by scope + identity.
 
@@ -421,30 +429,30 @@ def get_running_pid() -> Optional[int]:
     """
     record = _read_pid_record()
     if not record:
-        remove_pid_file()
+        _remove_stale_pid_file()
         return None
 
     try:
         pid = int(record["pid"])
     except (KeyError, TypeError, ValueError):
-        remove_pid_file()
+        _remove_stale_pid_file()
         return None
 
     try:
         os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-    except (ProcessLookupError, PermissionError):
-        remove_pid_file()
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
+        _remove_stale_pid_file()
         return None
 
     recorded_start = record.get("start_time")
     current_start = _get_process_start_time(pid)
     if recorded_start is not None and current_start is not None and current_start != recorded_start:
-        remove_pid_file()
+        _remove_stale_pid_file()
         return None
 
     if not _looks_like_gateway_process(pid):
         if not _record_looks_like_gateway(record):
-            remove_pid_file()
+            _remove_stale_pid_file()
             return None
 
     return pid
