@@ -2912,11 +2912,11 @@ def gateway_command(args):
     # Service management commands
     if subcmd == "install":
         # NixOS/Homebrew-managed installs would fight their package manager's
-        # declarative config — keep the block. But hosts like the 叨灵 desktop
-        # shell set HERMES_MANAGED=xiashou and explicitly *want* the host to
+        # declarative config — keep the block. But desktop hosts set
+        # HERMES_MANAGED=xiashou/daoling and explicitly *want* the host to
         # drive `gateway install --force` on every upgrade (it's how plist env
-        # vars get refreshed). Allow the command through in that case.
-        if is_managed() and get_managed_system() != "虾手":
+        # vars get refreshed). Allow the command through in those cases.
+        if is_managed() and get_managed_system() not in {"虾手", "叨灵"}:
             managed_error("install gateway service (managed by NixOS)")
             return
         force = getattr(args, 'force', False)
@@ -2960,9 +2960,9 @@ def gateway_command(args):
             sys.exit(1)
     
     elif subcmd == "uninstall":
-        # Same logic as install above: xiashou-managed hosts drive the full
+        # Same logic as install above: desktop-managed hosts drive the full
         # service lifecycle, so don't block them.
-        if is_managed() and get_managed_system() != "虾手":
+        if is_managed() and get_managed_system() not in {"虾手", "叨灵"}:
             managed_error("uninstall gateway service (managed by NixOS)")
             return
         system = getattr(args, 'system', False)

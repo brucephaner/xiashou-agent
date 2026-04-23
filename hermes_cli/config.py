@@ -71,6 +71,7 @@ _MANAGED_SYSTEM_NAMES = {
     "nix": "NixOS",
     "nixos": "NixOS",
     "xiashou": "虾手",
+    "daoling": "叨灵",
 }
 
 
@@ -119,9 +120,9 @@ def format_managed_message(action: str = "modify this Hermes installation") -> s
     managed_system = get_managed_system() or "a package manager"
     raw = os.getenv("HERMES_MANAGED", "").strip().lower()
 
-    if managed_system == "虾手":
+    if managed_system in {"虾手", "叨灵"}:
         return (
-            "此 Hermes 由虾手桌面版管理。请从虾手应用内检查更新,"
+            f"此 Hermes 由{managed_system}桌面版管理。请从{managed_system}应用内检查更新,"
             "不要手动运行 `hermes update`。"
         )
 

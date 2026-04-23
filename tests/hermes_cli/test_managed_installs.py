@@ -17,6 +17,13 @@ def test_get_managed_system_homebrew(monkeypatch):
     assert recommended_update_command() == "brew upgrade hermes-agent"
 
 
+def test_get_managed_system_daoling(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED", "daoling")
+
+    assert get_managed_system() == "叨灵"
+    assert "叨灵桌面版" in format_managed_message("update Hermes Agent")
+
+
 def test_format_managed_message_homebrew(monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED", "homebrew")
 

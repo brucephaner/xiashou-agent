@@ -516,6 +516,31 @@ class TestGatewaySystemServiceRouting:
 
         assert calls == [(True, True, "alice")]
 
+    def test_gateway_install_allows_daoling_managed_desktop_host(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MANAGED", "daoling")
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_install",
+            lambda force=False, no_start=False: calls.append((force, no_start)),
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="install",
+                force=True,
+                system=False,
+                run_as_user=None,
+                no_start=True,
+            )
+        )
+
+        assert calls == [(True, True)]
+
     def test_gateway_install_reports_termux_manual_mode(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
