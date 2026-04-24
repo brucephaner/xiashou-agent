@@ -24,9 +24,11 @@ def _reset_contextvars():
     context, so a clear_session_vars() from test A (which sets vars to "")
     would leak into test B.  This fixture ensures each test starts clean.
     """
-    yield
     for var in _VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
+        var.set(_UNSET)
+    yield
+    for var in _VAR_MAP.values():
         var.set(_UNSET)
 
 
