@@ -333,35 +333,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
             _write_json_file(lock_path, record)
             return True, existing
 
-        stale = existing_pid is None
-        if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError):
-                stale = True
-            else:
-                current_start = _get_process_start_time(existing_pid)
-                if (
-                    existing.get("start_time") is not None
-                    and current_start is not None
-                    and current_start != existing.get("start_time")
-                ):
-                    stale = True
-                # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
-                # processes still respond to os.kill(pid, 0) but are not
-                # actually running. Treat them as stale so --replace works.
-                if not stale:
-                    try:
-                        _proc_status = Path(f"/proc/{existing_pid}/status")
-                        if _proc_status.exists():
-                            for _line in _proc_status.read_text().splitlines():
-                                if _line.startswith("State:"):
-                                    _state = _line.split()[1]
-                                    if _state in ("T", "t"):  # stopped or tracing stop
-                                        stale = True
-                                    break
-                    except (OSError, PermissionError):
-                        pass
+        stale = _lock_record_is_stale(existing)
         if stale:
             try:
                 lock_path.unlink(missing_ok=True)
@@ -386,6 +358,39 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
     return True, None
 
 
+def _lock_record_is_stale(record: dict[str, Any]) -> bool:
+    """Return True when a scoped-lock owner is gone or stopped."""
+    try:
+        pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return True
+
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
+        return True
+
+    current_start = _get_process_start_time(pid)
+    if (
+        record.get("start_time") is not None
+        and current_start is not None
+        and current_start != record.get("start_time")
+    ):
+        return True
+
+    # Stopped processes still respond to os.kill(pid, 0) but cannot release
+    # their locks. Treat them as stale so --replace can recover.
+    try:
+        proc_status = Path(f"/proc/{pid}/status")
+        if proc_status.exists():
+            for line in proc_status.read_text().splitlines():
+                if line.startswith("State:"):
+                    return line.split()[1] in ("T", "t")
+    except (OSError, PermissionError):
+        pass
+    return False
+
+
 def release_scoped_lock(scope: str, identity: str) -> None:
     """Release a previously-acquired scope lock when owned by this process."""
     lock_path = _get_scope_lock_path(scope, identity)
@@ -403,7 +408,7 @@ def release_scoped_lock(scope: str, identity: str) -> None:
 
 
 def release_all_scoped_locks() -> int:
-    """Remove all scoped lock files in the lock directory.
+    """Remove stale scoped lock files in the lock directory.
 
     Called during --replace to clean up stale locks left by stopped/killed
     gateway processes that did not release their locks gracefully.
@@ -413,6 +418,9 @@ def release_all_scoped_locks() -> int:
     removed = 0
     if lock_dir.exists():
         for lock_file in lock_dir.glob("*.lock"):
+            existing = _read_json_file(lock_file)
+            if existing is not None and not _lock_record_is_stale(existing):
+                continue
             try:
                 lock_file.unlink(missing_ok=True)
                 removed += 1

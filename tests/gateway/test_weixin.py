@@ -58,6 +58,79 @@ class TestWeixinFormatting:
         assert adapter.format_message(None) == ""
 
 
+class TestWeixinCrossProcessDedup:
+    def test_claim_inbound_message_once_blocks_second_claim(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1") is True
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1") is False
+        assert weixin._claim_inbound_message_once("acct-1", "msg-2") is True
+
+    def test_claim_inbound_message_once_recovers_stale_claim(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        claim_path = weixin._message_claim_path("acct-1", "msg-1")
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        claim_path.write_text(json.dumps({"created_at": 1}), encoding="utf-8")
+        old_mtime = weixin.time.time() - 10
+        os.utime(claim_path, (old_mtime, old_mtime))
+
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1", ttl_seconds=0.1) is True
+        payload = json.loads(claim_path.read_text(encoding="utf-8"))
+        assert payload["pid"] == os.getpid()
+
+    def test_claim_inbound_message_once_keeps_fresh_corrupt_claim(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        claim_path = weixin._message_claim_path("acct-1", "msg-1")
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        claim_path.write_text("", encoding="utf-8")
+
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1", ttl_seconds=60) is False
+        assert claim_path.exists()
+
+    def test_claim_inbound_message_once_scopes_by_account(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+
+        assert weixin._claim_inbound_message_once("acct-1", "same-msg") is True
+        assert weixin._claim_inbound_message_once("acct-2", "same-msg") is True
+
+    def test_claim_inbound_message_once_fails_open_when_claim_dir_unusable(self, tmp_path, monkeypatch):
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setattr(
+            weixin,
+            "_message_claim_path",
+            lambda _account_id, _message_id: blocked / "claim.seen",
+        )
+
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1") is True
+
+    def test_claim_inbound_message_once_fails_open_when_claim_create_errors(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+
+        def fake_open(*_args, **_kwargs):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(weixin.os, "open", fake_open)
+
+        assert weixin._claim_inbound_message_once("acct-1", "msg-1") is True
+
+    def test_claim_inbound_message_once_prunes_expired_claims(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        monkeypatch.setattr(weixin, "_MESSAGE_CLAIM_PRUNE_LAST", 0.0)
+        stale_path = weixin._message_claim_path("acct-1", "old-msg")
+        fresh_path = weixin._message_claim_path("acct-1", "fresh-msg")
+        stale_path.parent.mkdir(parents=True, exist_ok=True)
+        stale_path.write_text(json.dumps({"created_at": 1}), encoding="utf-8")
+        fresh_path.write_text(json.dumps({"created_at": weixin.time.time()}), encoding="utf-8")
+        old_mtime = weixin.time.time() - 10
+        os.utime(stale_path, (old_mtime, old_mtime))
+
+        assert weixin._claim_inbound_message_once("acct-1", "new-msg", ttl_seconds=1.0) is True
+
+        assert not stale_path.exists()
+        assert fresh_path.exists()
+
+
 class TestWeixinChunking:
     def test_split_text_splits_short_chatty_replies_into_separate_bubbles(self):
         adapter = _make_adapter()

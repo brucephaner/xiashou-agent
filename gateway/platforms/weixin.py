@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import logging
 import mimetypes
@@ -91,6 +92,7 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 DEFAULT_SESSION_PAUSE_SECONDS = 60 * 60
 MESSAGE_DEDUP_TTL_SECONDS = 300
+MESSAGE_CLAIM_PRUNE_INTERVAL_SECONDS = 60
 
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
@@ -98,6 +100,7 @@ MEDIA_FILE = 3
 MEDIA_VOICE = 4
 
 _LIVE_ADAPTERS: Dict[str, Any] = {}
+_MESSAGE_CLAIM_PRUNE_LAST = 0.0
 
 
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
@@ -1041,6 +1044,112 @@ def _sync_buf_path(hermes_home: str, account_id: str) -> Path:
     return _account_dir(hermes_home) / f"{account_id}.sync.json"
 
 
+def _message_claim_dir() -> Path:
+    """Machine-local directory for cross-process inbound message claims."""
+    override = os.getenv("HERMES_GATEWAY_LOCK_DIR")
+    if override:
+        return Path(override)
+    state_home = Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "hermes" / "gateway-locks"
+
+
+def _message_claim_path(account_id: str, message_id: str) -> Path:
+    key = f"{account_id}\0{message_id}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return _message_claim_dir() / f"weixin-message-{digest}.seen"
+
+
+def _message_claim_age_seconds(claim_path: Path, now: float) -> Optional[float]:
+    try:
+        return now - claim_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _prune_message_claims(
+    claim_dir: Path,
+    now: float,
+    *,
+    ttl_seconds: float,
+    max_files: int = 256,
+) -> None:
+    """Best-effort pruning for expired cross-process message claims."""
+    global _MESSAGE_CLAIM_PRUNE_LAST
+    if now - _MESSAGE_CLAIM_PRUNE_LAST < MESSAGE_CLAIM_PRUNE_INTERVAL_SECONDS:
+        return
+    _MESSAGE_CLAIM_PRUNE_LAST = now
+    try:
+        candidates = itertools.islice(claim_dir.glob("weixin-message-*.seen"), max_files)
+    except OSError:
+        return
+    for claim_path in candidates:
+        age = _message_claim_age_seconds(claim_path, now)
+        if age is not None and age >= ttl_seconds:
+            try:
+                claim_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _claim_inbound_message_once(
+    account_id: str,
+    message_id: str,
+    *,
+    ttl_seconds: float = MESSAGE_DEDUP_TTL_SECONDS,
+) -> bool:
+    """Atomically claim a Weixin inbound message across gateway processes."""
+    if not message_id:
+        return True
+    path = _message_claim_path(account_id, message_id)
+    now = time.time()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _prune_message_claims(path.parent, now, ttl_seconds=ttl_seconds)
+    except OSError as exc:
+        logger.debug("weixin message claim setup failed open: %s", exc)
+        return True
+
+    record = {
+        "pid": os.getpid(),
+        "account_hash": hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:16],
+        "message_hash": hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:16],
+        "created_at": now,
+    }
+
+    for attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            age = _message_claim_age_seconds(path, now)
+            if age is None:
+                logger.debug("weixin message claim stat failed; treating existing claim as duplicate")
+                return False
+            if age < ttl_seconds:
+                return False
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return True
+            if attempt == 0:
+                continue
+            return True
+        except OSError as exc:
+            logger.debug("weixin message claim create failed open: %s", exc)
+            return True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle)
+            return True
+        except Exception as exc:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            logger.debug("weixin message claim write failed open: %s", exc)
+            return True
+    return True
+
+
 def _load_sync_buf(hermes_home: str, account_id: str) -> str:
     path = _sync_buf_path(hermes_home, account_id)
     if not path.exists():
@@ -1430,6 +1539,9 @@ class WeixinAdapter(BasePlatformAdapter):
 
         message_id = str(message.get("message_id") or "").strip()
         if message_id and self._dedup.is_duplicate(message_id):
+            return
+        if message_id and not _claim_inbound_message_once(self._account_id, message_id):
+            logger.debug("[%s] dropping cross-process duplicate message_id=%s", self.name, message_id)
             return
 
         chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)

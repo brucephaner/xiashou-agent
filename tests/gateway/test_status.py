@@ -226,6 +226,26 @@ class TestScopedLocks:
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
 
+    def test_acquire_scoped_lock_treats_oserror_probe_as_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "weixin-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        def fake_kill(pid, sig):
+            raise OSError("WinError 87")
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+
+        acquired, _ = status.acquire_scoped_lock("weixin-bot-token", "secret", metadata={"platform": "weixin"})
+
+        assert acquired is True
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+
     def test_acquire_scoped_lock_recovers_empty_lock_file(self, tmp_path, monkeypatch):
         """Empty lock file (0 bytes) left by a crashed process should be treated as stale."""
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
@@ -262,4 +282,71 @@ class TestScopedLocks:
         assert lock_path.exists()
 
         status.release_scoped_lock("telegram-bot-token", "secret")
+        assert not lock_path.exists()
+
+    def test_release_all_scoped_locks_keeps_live_other_process(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = status._get_scope_lock_path("weixin-bot-token", "secret")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+
+        removed = status.release_all_scoped_locks()
+
+        assert removed == 0
+        assert lock_path.exists()
+
+    def test_release_all_scoped_locks_removes_only_stale_records(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        live_path = status._get_scope_lock_path("weixin-bot-token", "live")
+        stale_path = status._get_scope_lock_path("weixin-bot-token", "stale")
+        live_path.parent.mkdir(parents=True, exist_ok=True)
+        live_path.write_text(json.dumps({
+            "pid": 111,
+            "start_time": 1111,
+            "kind": "hermes-gateway",
+        }))
+        stale_path.write_text(json.dumps({
+            "pid": 222,
+            "start_time": 2222,
+            "kind": "hermes-gateway",
+        }))
+
+        def fake_kill(pid, sig):
+            if pid == 222:
+                raise ProcessLookupError
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1111 if pid == 111 else None)
+
+        removed = status.release_all_scoped_locks()
+
+        assert removed == 1
+        assert live_path.exists()
+        assert not stale_path.exists()
+
+    def test_release_all_scoped_locks_removes_oserror_probe_records(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = status._get_scope_lock_path("weixin-bot-token", "secret")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        def fake_kill(pid, sig):
+            raise OSError("WinError 87")
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+
+        removed = status.release_all_scoped_locks()
+
+        assert removed == 1
         assert not lock_path.exists()
