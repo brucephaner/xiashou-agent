@@ -735,20 +735,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_context_env_vars,
+        set_context_env_vars,
+        set_session_vars,
+    )
 
     _ctx_tokens = set_session_vars(
         platform=origin["platform"] if origin else "",
         chat_id=str(origin["chat_id"]) if origin else "",
         chat_name=origin.get("chat_name", "") if origin else "",
     )
+    _cron_ctx_tokens = set_context_env_vars({"HERMES_CRON_SESSION": "1"})
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -760,11 +761,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
         delivery_target = _resolve_delivery_target(job)
+        auto_delivery_ctx = {
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM": "",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "",
+        }
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            auto_delivery_ctx["HERMES_CRON_AUTO_DELIVER_PLATFORM"] = delivery_target["platform"]
+            auto_delivery_ctx["HERMES_CRON_AUTO_DELIVER_CHAT_ID"] = str(delivery_target["chat_id"])
             if delivery_target.get("thread_id") is not None:
-                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(str(delivery_target["thread_id"]))
+                auto_delivery_ctx["HERMES_CRON_AUTO_DELIVER_THREAD_ID"] = str(delivery_target["thread_id"])
+        _cron_ctx_tokens.extend(set_context_env_vars(auto_delivery_ctx))
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
@@ -1032,6 +1039,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     finally:
         # Clean up ContextVar session/delivery state for this job.
+        reset_context_env_vars(_cron_ctx_tokens)
         clear_session_vars(_ctx_tokens)
         if _session_db:
             try:

@@ -525,6 +525,7 @@ async def _send_message(
         payload={"msg": message},
         token=token,
         timeout_ms=API_TIMEOUT_MS,
+        allow_business_error=True,
     )
 
 
@@ -1710,16 +1711,15 @@ class WeixinAdapter(BasePlatformAdapter):
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
-        async def _deliver_media(path: str, is_voice: bool = False) -> None:
+        async def _deliver_media(path: str, is_voice: bool = False) -> SendResult:
             ext = Path(path).suffix.lower()
             if is_voice or ext in _AUDIO_EXTS:
-                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+                return await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
-                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                return await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
-            else:
-                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                return await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+            return await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
 
         try:
             self._assert_session_active()
@@ -1727,16 +1727,28 @@ class WeixinAdapter(BasePlatformAdapter):
             # Deliver extracted MEDIA: attachments first.
             for media_path, is_voice in media_files:
                 try:
-                    await _deliver_media(media_path, is_voice)
+                    media_result = await _deliver_media(media_path, is_voice)
                 except Exception as exc:
                     logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+                    return SendResult(success=False, error=str(exc))
+                if not media_result.success:
+                    error = media_result.error or "media delivery failed"
+                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, error)
+                    return SendResult(success=False, error=error)
+                last_message_id = media_result.message_id or last_message_id
 
             # Deliver bare local file paths.
             for file_path in local_files:
                 try:
-                    await _deliver_media(file_path, is_voice=False)
+                    media_result = await _deliver_media(file_path, is_voice=False)
                 except Exception as exc:
                     logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+                    return SendResult(success=False, error=str(exc))
+                if not media_result.success:
+                    error = media_result.error or "local file delivery failed"
+                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, error)
+                    return SendResult(success=False, error=error)
+                last_message_id = media_result.message_id or last_message_id
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]

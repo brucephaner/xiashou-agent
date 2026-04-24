@@ -358,6 +358,43 @@ class TestWeixinChunkDelivery:
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
+    @patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock)
+    def test_send_message_allows_business_error_for_context_token_retry(self, api_post_mock):
+        api_post_mock.return_value = {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE}
+
+        result = asyncio.run(
+            weixin._send_message(
+                object(),
+                base_url="https://weixin.example.com",
+                token="test-token",
+                to="wxid_test123",
+                text="hello",
+                context_token="ctx-token",
+                client_id="client-1",
+            )
+        )
+
+        assert result["errcode"] == weixin.SESSION_EXPIRED_ERRCODE
+        assert api_post_mock.await_args.kwargs["allow_business_error"] is True
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_retries_session_expired_chunk_without_context_token(self, send_message_mock):
+        adapter = self._connected_adapter()
+        send_message_mock.side_effect = [
+            {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "expired"},
+            {"ret": 0, "errcode": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        first_call = send_message_mock.await_args_list[0].kwargs
+        retry_call = send_message_mock.await_args_list[1].kwargs
+        assert first_call["context_token"] == "ctx-token"
+        assert retry_call["context_token"] is None
+        assert first_call["client_id"] == retry_call["client_id"]
+
 
 class TestWeixinSessionGuard:
     def _connected_adapter(self, account_id: str) -> WeixinAdapter:
@@ -486,6 +523,31 @@ class TestWeixinOutboundMedia:
             caption="截图说明",
             metadata={"thread_id": "t-1"},
         )
+
+    def test_send_media_failure_marks_overall_send_failed(self):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter.send_image_file = AsyncMock(return_value=SendResult(success=False, error="upload failed"))
+
+        result = asyncio.run(adapter.send("wxid_test123", "MEDIA:/tmp/demo.png"))
+
+        assert result.success is False
+        assert result.error == "upload failed"
+        adapter.send_image_file.assert_awaited_once()
+
+    def test_send_media_only_returns_media_message_id(self):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter.send_image_file = AsyncMock(return_value=SendResult(success=True, message_id="media-msg"))
+
+        result = asyncio.run(adapter.send("wxid_test123", "MEDIA:/tmp/demo.png"))
+
+        assert result.success is True
+        assert result.message_id == "media-msg"
 
     def test_send_document_accepts_keyword_file_path(self):
         adapter = _make_adapter()

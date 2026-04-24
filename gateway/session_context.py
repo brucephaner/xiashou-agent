@@ -55,6 +55,7 @@ _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -70,6 +71,7 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -126,6 +128,23 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
     ):
         var.set("")
+
+
+def set_context_env_vars(values: dict[str, str]) -> list:
+    """Set named context-backed environment variables and return reset tokens."""
+    tokens = []
+    for name, value in values.items():
+        var = _VAR_MAP.get(name)
+        if var is None:
+            raise KeyError(f"unknown session context variable: {name}")
+        tokens.append((var, var.set(value)))
+    return tokens
+
+
+def reset_context_env_vars(tokens: list) -> None:
+    """Restore context-backed environment variables set by set_context_env_vars()."""
+    for var, token in reversed(tokens):
+        var.reset(token)
 
 
 def get_session_env(name: str, default: str = "") -> str:

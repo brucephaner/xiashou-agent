@@ -923,6 +923,66 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
 
+    def test_run_job_clears_auto_delivery_context_between_jobs(self, tmp_path, monkeypatch):
+        jobs = [
+            {
+                "id": "first-job",
+                "name": "first",
+                "prompt": "hello",
+                "deliver": "telegram",
+            },
+            {
+                "id": "second-job",
+                "name": "second",
+                "prompt": "hello",
+            },
+        ]
+        fake_db = MagicMock()
+        seen = []
+
+        (tmp_path / ".env").write_text("TELEGRAM_HOME_CHANNEL=-2002\n")
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                seen.append({
+                    "platform": get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None,
+                    "chat_id": get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None,
+                    "thread_id": get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None,
+                })
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            for job in jobs:
+                success, output, final_response, error = run_job(job)
+                assert success is True
+                assert error is None
+                assert final_response == "ok"
+                assert "ok" in output
+
+        assert seen == [
+            {"platform": "telegram", "chat_id": "-2002", "thread_id": None},
+            {"platform": None, "chat_id": None, "thread_id": None},
+        ]
+
 
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""

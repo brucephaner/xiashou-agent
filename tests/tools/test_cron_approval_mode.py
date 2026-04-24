@@ -213,6 +213,20 @@ class TestCronDenyModeAllGuards:
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
             assert result["approved"]
 
+    def test_combined_guard_cron_deny_wins_over_gateway_exec_ask(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert result.get("status") != "approval_required"
+            assert "cron jobs run without a user present" in result["message"]
+
 
 # ---------------------------------------------------------------------------
 # Edge cases: cron mode interaction with other approval mechanisms
