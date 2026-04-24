@@ -12,6 +12,16 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scheduler_tick_lock(tmp_path):
+    """Give each test its own tick lock so xdist workers cannot skip each other."""
+    lock_dir = tmp_path / "cron-lock"
+    lock_dir.mkdir()
+    with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+         patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+        yield
+
+
 class TestResolveOrigin:
     def test_full_origin(self):
         job = {
