@@ -1664,9 +1664,14 @@ class WeixinAdapter(BasePlatformAdapter):
                             )
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-                        raise RuntimeError(
-                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
-                        )
+                        if is_session_expired:
+                            raise WeixinSessionExpiredError(
+                                EP_SEND_MESSAGE,
+                                ret=ret,
+                                errcode=errcode,
+                                errmsg=str(errmsg),
+                            )
+                        _raise_for_business_error(EP_SEND_MESSAGE, resp)
                 return
             except WeixinSessionExpiredError as exc:
                 self._pause_session(f"{exc.endpoint} reported expired session during sendMessage")
@@ -2011,7 +2016,7 @@ class WeixinAdapter(BasePlatformAdapter):
             last_message_id = None
             if caption:
                 last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                await _send_message(
+                caption_response = await _send_message(
                     self._send_session,
                     base_url=self._base_url,
                     token=self._token,
@@ -2020,6 +2025,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     context_token=context_token,
                     client_id=last_message_id,
                 )
+                _raise_for_business_error(EP_SEND_MESSAGE, caption_response)
 
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
             await _api_post(

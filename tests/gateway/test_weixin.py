@@ -395,6 +395,27 @@ class TestWeixinChunkDelivery:
         assert retry_call["context_token"] is None
         assert first_call["client_id"] == retry_call["client_id"]
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_pauses_when_tokenless_retry_still_session_expired(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter._session_pause_seconds = 37
+        send_message_mock.side_effect = [
+            {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "expired"},
+            {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "still expired"},
+        ]
+
+        weixin._clear_session_pause(adapter._account_id)
+        try:
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+            assert result.success is False
+            assert "已暂停请求" in result.error
+            assert weixin._get_paused_session(adapter._account_id) is not None
+            assert send_message_mock.await_count == 2
+            assert send_message_mock.await_args_list[1].kwargs["context_token"] is None
+        finally:
+            weixin._clear_session_pause(adapter._account_id)
+
 
 class TestWeixinSessionGuard:
     def _connected_adapter(self, account_id: str) -> WeixinAdapter:
@@ -570,6 +591,39 @@ class TestWeixinOutboundMedia:
         assert result.success is True
         assert result.message_id == "msg-2"
         adapter._send_file.assert_awaited_once_with("wxid_test123", "/tmp/report.pdf", "报告请看")
+
+    @patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._upload_ciphertext", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._get_upload_url", new_callable=AsyncMock)
+    def test_send_document_caption_business_error_fails_delivery(
+        self,
+        get_upload_url_mock,
+        upload_ciphertext_mock,
+        send_message_mock,
+        api_post_mock,
+        tmp_path,
+    ):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._cdn_base_url = "https://cdn.example.com/c2c"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+
+        file_path = tmp_path / "report.txt"
+        file_path.write_text("report", encoding="utf-8")
+        get_upload_url_mock.return_value = {"upload_full_url": "https://upload.example.com/media"}
+        upload_ciphertext_mock.return_value = "encrypted-param"
+        send_message_mock.return_value = {"ret": 0, "errcode": 123, "errmsg": "caption blocked"}
+
+        result = asyncio.run(adapter.send_document("wxid_test123", str(file_path), caption="报告请看"))
+
+        assert result.success is False
+        assert "caption blocked" in result.error
+        send_message_mock.assert_awaited_once()
+        api_post_mock.assert_not_awaited()
 
     def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
         class _UploadResponse:
