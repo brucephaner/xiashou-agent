@@ -792,7 +792,9 @@ class TestWeixinSendImageFileParameterName:
 class TestWeixinVoiceSending:
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()
-        adapter._session = object()
+        session = object()
+        adapter._session = session
+        adapter._send_session = session
         adapter._token = "test-token"
         adapter._base_url = "https://weixin.example.com"
         adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
