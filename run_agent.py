@@ -9233,6 +9233,78 @@ class AIAgent:
                                 "error": _exhaust_error,
                             }
 
+                        if self.api_mode == "anthropic_messages":
+                            from agent.anthropic_adapter import normalize_anthropic_response
+
+                            assistant_message, _ = normalize_anthropic_response(
+                                response,
+                                strip_tool_prefix=self._is_anthropic_oauth,
+                            )
+                            if getattr(assistant_message, "tool_calls", None):
+                                if truncated_tool_call_retries < 1:
+                                    truncated_tool_call_retries += 1
+                                    self._vprint(
+                                        f"{self.log_prefix}⚠️  Truncated Anthropic tool call detected — retrying API call...",
+                                        force=True,
+                                    )
+                                    continue
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Truncated Anthropic tool call response detected again — refusing to execute incomplete tool arguments.",
+                                    force=True,
+                                )
+                                self._cleanup_task_resources(effective_task_id)
+                                self._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": None,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": "模型回复被输出长度限制截断，请缩短要求后重试。",
+                                }
+
+                            if assistant_message.content:
+                                length_continue_retries += 1
+                                interim_msg = self._build_assistant_message(
+                                    assistant_message,
+                                    finish_reason,
+                                )
+                                messages.append(interim_msg)
+                                truncated_response_prefix += assistant_message.content
+
+                                if length_continue_retries < 3:
+                                    self._vprint(
+                                        f"{self.log_prefix}↻ Requesting Anthropic continuation "
+                                        f"({length_continue_retries}/3)..."
+                                    )
+                                    continue_msg = {
+                                        "role": "user",
+                                        "content": (
+                                            "[System: Your previous response was truncated by the output "
+                                            "length limit. Continue exactly where you left off. Do not "
+                                            "restart or repeat prior text. Finish the answer directly.]"
+                                        ),
+                                    }
+                                    messages.append(continue_msg)
+                                    self._session_messages = messages
+                                    self._save_session_log(messages)
+                                    restart_with_length_continuation = True
+                                    break
+
+                                partial_response = self._strip_think_blocks(
+                                    truncated_response_prefix
+                                ).strip()
+                                self._cleanup_task_resources(effective_task_id)
+                                self._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": partial_response or None,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": "模型回复连续续写后仍被输出长度限制截断。",
+                                }
+
                         if self.api_mode in ("chat_completions", "bedrock_converse"):
                             assistant_message = response.choices[0].message
                             if not assistant_message.tool_calls:
@@ -9270,7 +9342,7 @@ class AIAgent:
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "partial": True,
-                                    "error": "Response remained truncated after 3 continuation attempts",
+                                    "error": "模型回复连续续写后仍被输出长度限制截断。",
                                 }
 
                         if self.api_mode in ("chat_completions", "bedrock_converse"):
@@ -9298,7 +9370,7 @@ class AIAgent:
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "partial": True,
-                                    "error": "Response truncated due to output length limit",
+                                    "error": "模型回复被输出长度限制截断，请缩短要求后重试。",
                                 }
 
                         # If we have prior messages, roll back to last complete state
@@ -9315,7 +9387,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit"
+                                "error": "模型回复被输出长度限制截断，请缩短要求后重试。"
                             }
                         else:
                             # First message was truncated - mark as failed
@@ -9327,7 +9399,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "failed": True,
-                                "error": "First response truncated due to output length limit"
+                                "error": "模型第一段回复被输出长度限制截断，请缩短要求后重试。"
                             }
                     
                     # Track actual token usage from response for context management
@@ -10597,7 +10669,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit",
+                                "error": "模型工具调用参数被输出长度限制截断，请缩短要求后重试。",
                             }
 
                         # Track retries for invalid JSON arguments
