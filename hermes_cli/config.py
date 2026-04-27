@@ -292,10 +292,24 @@ def _secure_file(path):
 
 
 def _ensure_default_soul_md(home: Path) -> None:
-    """Seed a default SOUL.md into HERMES_HOME if the user doesn't have one yet."""
+    """Seed (or refresh) the default SOUL.md in HERMES_HOME.
+
+    If the file is missing, write the current default. If it exists but
+    its content matches a known-stale default from a previous version,
+    overwrite it so users on long-running installs pick up persona
+    refreshes without manual intervention. Anything else (user
+    customizations) is left untouched.
+    """
+    from hermes_cli.default_soul import is_stale_default_soul_md
+
     soul_path = home / "SOUL.md"
     if soul_path.exists():
-        return
+        try:
+            current = soul_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        if current == DEFAULT_SOUL_MD or not is_stale_default_soul_md(current):
+            return
     soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
     _secure_file(soul_path)
 

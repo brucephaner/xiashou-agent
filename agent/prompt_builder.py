@@ -131,37 +131,12 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
-def _compute_default_agent_identity() -> str:
-    """Build the fallback identity string from host-provided brand/version.
-
-    Read at module import time so all downstream users see a plain string
-    constant. Host apps set `DAOLING_BRAND` / `DAOLING_VERSION` env vars
-    before spawning this process; absent those, `get_brand()` /
-    `get_display_version()` fall back to neutral framework values.
-
-    The version-query guidance line is there so the LLM doesn't reach
-    for the shell tool (and trigger an approval prompt on gateways that
-    gate shell commands) to look up a version that's already right here.
-    """
-    from hermes_cli import get_brand, get_display_version
-
-    brand = get_brand()
-    version = get_display_version()
-    return (
-        f"You are {brand} v{version}, an intelligent AI assistant. "
-        "You are helpful, knowledgeable, and direct. You assist users with a wide "
-        "range of tasks including answering questions, writing and editing code, "
-        "analyzing information, creative work, and executing actions via your tools. "
-        "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-        "being genuinely useful over being verbose unless otherwise directed below. "
-        "Be targeted and efficient in your exploration and investigations. "
-        "When the user asks about your identity or version, answer with "
-        f'exactly "{brand} v{version}" and do NOT run shell commands '
-        "(like `cat package.json`) to look it up — the answer is already here."
-    )
-
-
-DEFAULT_AGENT_IDENTITY = _compute_default_agent_identity()
+# Runtime fallback identity used when no SOUL.md exists on disk. Same
+# string as the file seed in `hermes_cli.default_soul.DEFAULT_SOUL_MD` —
+# single source of truth, so the user gets identical behavior whether
+# `_ensure_default_soul_md` ran first or not. Host brand/version is
+# injected separately via `HOST_IDENTITY_META` below.
+from hermes_cli.default_soul import DEFAULT_SOUL_MD as DEFAULT_AGENT_IDENTITY  # noqa: E402
 
 
 def _compute_host_identity_meta() -> str:
