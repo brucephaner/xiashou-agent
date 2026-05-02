@@ -14,6 +14,8 @@ Usage:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -730,6 +732,137 @@ _REFRESH_KEY_PROBE_RETRY_DELAY_S = 1.5
 
 def _refresh_backend_base_url() -> str:
     return os.environ.get("DAOLING_BACKEND_BASE_URL", "https://shouxia.ai").rstrip("/")
+
+
+_DAOLING_INVITE_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+_DAOLING_INVITE_GATE_TIMEOUT_S = 5.0
+_DAOLING_INVITE_PROMPT_FALLBACK = (
+    "这轮体验次数已用完。继续使用请发送邀请码；如果你已经付款，直接把邀请码发给我就行。"
+)
+
+
+def _daoling_api_headers() -> Dict[str, str]:
+    version = (
+        os.environ.get("DAOLING_VERSION")
+        or os.environ.get("HERMES_VERSION")
+        or os.environ.get("APP_VERSION")
+        or "unknown"
+    )
+    return {
+        "User-Agent": f"daoling-gateway/{version}",
+        "X-App-Version": version,
+        "X-Platform": sys.platform,
+    }
+
+
+def _daoling_current_api_key() -> str:
+    try:
+        runtime = _resolve_runtime_agent_kwargs()
+        return str(runtime.get("api_key") or "").strip()
+    except Exception as exc:
+        logger.debug("Daoling invite gate could not resolve active api key: %s", exc)
+        return ""
+
+
+def _daoling_normalize_wechat_user_id(raw: str) -> str:
+    user_id = str(raw or "").strip()
+    if "@" in user_id:
+        user_id = user_id.split("@", 1)[0]
+    return user_id
+
+
+def _daoling_normalize_invite_code(raw: str) -> str:
+    return re.sub(r"[\s-]+", "", str(raw or "").strip()).upper()
+
+
+def _daoling_is_invite_code_message(raw: str) -> bool:
+    code = _daoling_normalize_invite_code(raw)
+    return len(code) == 6 and all(ch in _DAOLING_INVITE_CODE_ALPHABET for ch in code)
+
+
+async def _daoling_post_signed_json(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    import aiohttp
+
+    api_key = _daoling_current_api_key()
+    if not api_key:
+        return None
+
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        api_key.encode("utf-8"),
+        f"{timestamp}.{body}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers = _daoling_api_headers()
+    headers.update(
+        {
+            "Content-Type": "application/json",
+            "X-Daoling-Gateway-Timestamp": timestamp,
+            "X-Daoling-Gateway-Signature": signature,
+        }
+    )
+
+    url = f"{_refresh_backend_base_url()}{path}"
+    timeout = aiohttp.ClientTimeout(total=_DAOLING_INVITE_GATE_TIMEOUT_S)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(url, data=body.encode("utf-8"), headers=headers) as resp:
+                text = await resp.text()
+                try:
+                    data = json.loads(text) if text else {}
+                except Exception:
+                    logger.info("Daoling invite gate returned non-JSON HTTP %s", resp.status)
+                    return {"_http_status": resp.status}
+                if isinstance(data, dict):
+                    data["_http_status"] = resp.status
+                    return data
+                return {"_http_status": resp.status}
+    except asyncio.TimeoutError:
+        logger.info("Daoling invite gate request timed out: %s", path)
+    except Exception as exc:
+        logger.info("Daoling invite gate request failed: %s", exc)
+    return None
+
+
+async def _daoling_check_invite_access(user_id: str, *, consume: bool) -> Optional[str]:
+    openid = _daoling_normalize_wechat_user_id(user_id)
+    if not openid:
+        return None
+    data = await _daoling_post_signed_json(
+        "/api/access/check",
+        {"wechat_user_id": openid, "consume": consume},
+    )
+    if not data:
+        return None
+    if data.get("allowed") is False:
+        prompt = str(data.get("promptText") or "").strip()
+        return prompt or _DAOLING_INVITE_PROMPT_FALLBACK
+    return None
+
+
+async def _daoling_redeem_invite(user_id: str, raw_code: str) -> str:
+    openid = _daoling_normalize_wechat_user_id(user_id)
+    code = _daoling_normalize_invite_code(raw_code)
+    data = await _daoling_post_signed_json(
+        "/api/invite/redeem",
+        {"wechat_user_id": openid, "invite_code": code},
+    )
+    if not data:
+        return "暂时验证不了邀请码，请稍后再试。"
+    if data.get("ok") is True:
+        return "邀请码已生效，可以继续使用了。"
+
+    error = str(data.get("error") or "").strip()
+    if error == "rate_limited":
+        return "邀请码尝试次数太多，请稍后再试。"
+    if error == "code_expired":
+        return "这个邀请码已过期，请换一个邀请码。"
+    if error == "code_disabled":
+        return "这个邀请码已停用，请换一个邀请码。"
+    if error == "code_exhausted":
+        return "这个邀请码已被使用完，请换一个邀请码。"
+    return "邀请码无效，请检查后重新发送。"
 
 
 def _parse_session_key(session_key: str) -> "dict | None":
@@ -3189,6 +3322,19 @@ class GatewayRunner:
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
+
+        if source.platform == Platform.WEIXIN and not getattr(event, "internal", False):
+            wechat_user_id = _daoling_normalize_wechat_user_id(source.user_id or "")
+            if wechat_user_id:
+                raw_text = (event.text or "").strip()
+                if _daoling_is_invite_code_message(raw_text):
+                    return await _daoling_redeem_invite(wechat_user_id, raw_text)
+                invite_prompt = await _daoling_check_invite_access(
+                    wechat_user_id,
+                    consume=event.get_command() is None,
+                )
+                if invite_prompt:
+                    return invite_prompt
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
