@@ -90,9 +90,22 @@ MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
 BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
+RATE_LIMIT_ERRCODE = -2
 DEFAULT_SESSION_PAUSE_SECONDS = 60 * 60
 MESSAGE_DEDUP_TTL_SECONDS = 300
 MESSAGE_CLAIM_PRUNE_INTERVAL_SECONDS = 60
+
+
+def _is_stale_session_ret(
+    ret: Optional[int],
+    errcode: Optional[int],
+    errmsg: Optional[str],
+) -> bool:
+    """iLink can report a stale session as ret=-2 with "unknown error"."""
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    return (errmsg or "").strip().lower() == "unknown error"
+
 
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
@@ -211,7 +224,15 @@ def _raise_for_business_error(endpoint: str, payload: Dict[str, Any]) -> None:
     if ret in (0, None) and errcode in (0, None):
         return
     errmsg = str(payload.get("errmsg") or "")
-    exc_type = WeixinSessionExpiredError if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE else WeixinApiError
+    exc_type = (
+        WeixinSessionExpiredError
+        if (
+            ret == SESSION_EXPIRED_ERRCODE
+            or errcode == SESSION_EXPIRED_ERRCODE
+            or _is_stale_session_ret(ret, errcode, errmsg)
+        )
+        else WeixinApiError
+    )
     raise exc_type(endpoint, ret=ret, errcode=errcode, errmsg=errmsg)
 
 
@@ -1304,7 +1325,7 @@ async def qr_login(
 class WeixinAdapter(BasePlatformAdapter):
     """Native Hermes adapter for Weixin personal accounts."""
 
-    MAX_MESSAGE_LENGTH = 4000
+    MAX_MESSAGE_LENGTH = 2000
 
     # WeChat does not support editing sent messages — streaming must use the
     # fallback "send-final-only" path so the cursor (▉) is never left visible.
@@ -1329,10 +1350,10 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
         self._send_chunk_delay_seconds = float(
-            extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "0.35")
+            extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
         )
         self._send_chunk_retries = int(
-            extra.get("send_chunk_retries") or os.getenv("WEIXIN_SEND_CHUNK_RETRIES", "2")
+            extra.get("send_chunk_retries") or os.getenv("WEIXIN_SEND_CHUNK_RETRIES", "4")
         )
         self._send_chunk_retry_delay_seconds = float(
             extra.get("send_chunk_retry_delay_seconds")
@@ -1485,7 +1506,11 @@ class WeixinAdapter(BasePlatformAdapter):
                 ret = response.get("ret", 0)
                 errcode = response.get("errcode", 0)
                 if ret not in (0, None) or errcode not in (0, None):
-                    if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
+                    if (
+                        ret == SESSION_EXPIRED_ERRCODE
+                        or errcode == SESSION_EXPIRED_ERRCODE
+                        or _is_stale_session_ret(ret, errcode, response.get("errmsg"))
+                    ):
                         self._pause_session(
                             f"getUpdates reported expired session (errmsg={response.get('errmsg', '') or 'n/a'})"
                         )
@@ -1762,6 +1787,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
                             or errcode == SESSION_EXPIRED_ERRCODE
+                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
                         # Session expired: strip token and retry once.
                         if is_session_expired and not retried_without_token and context_token:
@@ -1783,6 +1809,25 @@ class WeixinAdapter(BasePlatformAdapter):
                                 errcode=errcode,
                                 errmsg=str(errmsg),
                             )
+                        is_rate_limited = (
+                            ret == RATE_LIMIT_ERRCODE
+                            or errcode == RATE_LIMIT_ERRCODE
+                        )
+                        if is_rate_limited:
+                            last_error = RuntimeError(
+                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+                            )
+                            if attempt >= self._send_chunk_retries:
+                                break
+                            wait = self._send_chunk_retry_delay_seconds * 3
+                            logger.warning(
+                                "[%s] rate limited for %s; backing off %.1fs before retry",
+                                self.name,
+                                _safe_id(chat_id),
+                                wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
                         _raise_for_business_error(EP_SEND_MESSAGE, resp)
                 return
             except WeixinSessionExpiredError as exc:

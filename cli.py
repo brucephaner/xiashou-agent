@@ -6376,10 +6376,16 @@ class HermesCLI:
 
         original_count = len(self.conversation_history)
         try:
-            from agent.model_metadata import estimate_messages_tokens_rough
+            from agent.model_metadata import estimate_request_tokens_rough
             from agent.manual_compression_feedback import summarize_manual_compression
             original_history = list(self.conversation_history)
-            approx_tokens = estimate_messages_tokens_rough(original_history)
+            _sys_prompt = getattr(self.agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(self.agent, "tools", None) or None
+            approx_tokens = estimate_request_tokens_rough(
+                original_history,
+                system_prompt=_sys_prompt,
+                tools=_tools,
+            )
             if focus_topic:
                 print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens), "
                       f"focus: \"{focus_topic}\"...")
@@ -6393,7 +6399,11 @@ class HermesCLI:
                 focus_topic=focus_topic or None,
             )
             self.conversation_history = compressed
-            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            new_tokens = estimate_request_tokens_rough(
+                self.conversation_history,
+                system_prompt=_sys_prompt,
+                tools=_tools,
+            )
             summary = summarize_manual_compression(
                 original_history,
                 self.conversation_history,

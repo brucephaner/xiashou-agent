@@ -114,13 +114,23 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def json_parse(", src)
         self.assertIn("def shell_quote(", src)
         self.assertIn("def retry(", src)
-        self.assertIn("import json, os, socket, shlex, time", src)
+        self.assertIn("import json, os, socket, shlex, threading, time", src)
 
     def test_file_transport_uses_tempfile_fallback_for_rpc_dir(self):
         src = generate_hermes_tools_module(["terminal"], transport="file")
-        self.assertIn("import json, os, shlex, tempfile, time", src)
+        self.assertIn("import json, os, shlex, tempfile, threading, time", src)
         self.assertIn("os.path.join(tempfile.gettempdir(), \"hermes_rpc\")", src)
         self.assertNotIn('os.environ.get("HERMES_RPC_DIR", "/tmp/hermes_rpc")', src)
+
+    def test_uds_transport_serializes_concurrent_calls(self):
+        src = generate_hermes_tools_module(["terminal"], transport="uds")
+        self.assertIn("_call_lock = threading.Lock()", src)
+        self.assertIn("with _call_lock:", src)
+
+    def test_file_transport_serializes_seq_allocation(self):
+        src = generate_hermes_tools_module(["terminal"], transport="file")
+        self.assertIn("_seq_lock = threading.Lock()", src)
+        self.assertIn("with _seq_lock:", src)
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
@@ -225,6 +235,52 @@ print(f"file lines: {r2['total_lines']}")
         """Script with a runtime error returns error status."""
         result = self._run("raise ValueError('test error')")
         self.assertEqual(result["status"], "error")
+
+    def test_concurrent_tool_calls_match_responses(self):
+        """Concurrent hermes_tools calls must each receive their own response."""
+        code = '''
+from concurrent.futures import ThreadPoolExecutor
+from hermes_tools import terminal
+
+N = 10
+
+def call(i):
+    result = terminal(f"echo TAG-{i}")
+    return i, result.get("output", "")
+
+with ThreadPoolExecutor(max_workers=N) as ex:
+    results = list(ex.map(call, range(N)))
+
+mismatches = [(i, out) for i, out in results if f"TAG-{i}" not in out]
+if mismatches:
+    print(f"MISMATCH {len(mismatches)}/{N}: {mismatches[:3]}")
+else:
+    print(f"OK {N}/{N}")
+'''
+
+        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+            import time as _time
+            if function_name == "terminal":
+                _time.sleep(0.05)
+                command = function_args.get("command", "")
+                output = command[5:] if command.startswith("echo ") else command
+                return json.dumps({"output": output, "exit_code": 0})
+            return _mock_handle_function_call(
+                function_name,
+                function_args,
+                task_id=task_id,
+                user_task=user_task,
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=slow_mock):
+            raw = execute_code(
+                code=code,
+                task_id="test-concurrent",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertIn("OK 10/10", result["output"])
 
     def test_excluded_tool_returns_error(self):
         """Script calling a tool not in the allow-list gets an error from RPC."""

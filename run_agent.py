@@ -23,6 +23,7 @@ Usage:
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import json
@@ -351,6 +352,20 @@ def _sanitize_surrogates(text: str) -> str:
     if _SURROGATE_RE.search(text):
         return _SURROGATE_RE.sub('\ufffd', text)
     return text
+
+
+def _base_url_host_matches(base_url: str | None, host_suffix: str) -> bool:
+    """Return True when ``base_url`` has host ``host_suffix`` or a subdomain."""
+    if not base_url or not host_suffix:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed_host = (urlparse(str(base_url)).hostname or "").lower()
+    except Exception:
+        parsed_host = ""
+    suffix = host_suffix.lower().lstrip(".")
+    return parsed_host == suffix or parsed_host.endswith(f".{suffix}")
 
 
 def _sanitize_messages_surrogates(messages: list) -> bool:
@@ -1511,13 +1526,21 @@ class AIAgent:
         # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
         self._context_engine_tool_names: set = set()
         if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
+            _existing_tool_names = {
+                t.get("function", {}).get("name")
+                for t in self.tools
+                if isinstance(t, dict)
+            }
             for _schema in self.context_compressor.get_tool_schemas():
+                _tname = _schema.get("name", "")
+                if _tname and _tname in _existing_tool_names:
+                    continue
                 _wrapped = {"type": "function", "function": _schema}
                 self.tools.append(_wrapped)
-                _tname = _schema.get("name", "")
                 if _tname:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
+                    _existing_tool_names.add(_tname)
 
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -1556,6 +1579,8 @@ class AIAgent:
         # When running against an Ollama server, detect the model's max context
         # and pass num_ctx on every chat request so the full window is used.
         # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
+        # model.context_length caps auto-detected num_ctx so GGUF metadata does
+        # not make Ollama allocate a larger VRAM budget than the user requested.
         self._ollama_num_ctx: int | None = None
         _ollama_num_ctx_override = None
         if isinstance(_model_cfg, dict):
@@ -1572,6 +1597,18 @@ class AIAgent:
                     self._ollama_num_ctx = _detected
             except Exception as exc:
                 logger.debug("Ollama num_ctx detection failed: %s", exc)
+        if (
+            self._ollama_num_ctx
+            and _config_context_length
+            and _ollama_num_ctx_override is None
+            and self._ollama_num_ctx > _config_context_length
+        ):
+            logger.info(
+                "Ollama num_ctx capped: %d -> %d (model.context_length override)",
+                self._ollama_num_ctx,
+                _config_context_length,
+            )
+            self._ollama_num_ctx = _config_context_length
         if self._ollama_num_ctx and not self.quiet_mode:
             logger.info(
                 "Ollama num_ctx: will request %d tokens (model max from /api/show)",
@@ -6840,6 +6877,7 @@ class AIAgent:
         Handles reasoning extraction, reasoning_details, and optional tool_calls
         so both the tool-call path and the final-response path share one builder.
         """
+        assistant_tool_calls = getattr(assistant_message, "tool_calls", None)
         reasoning_text = self._extract_reasoning(assistant_message)
         _from_structured = bool(reasoning_text)
 
@@ -6885,6 +6923,25 @@ class AIAgent:
             "finish_reason": finish_reason,
         }
 
+        raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
+        if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
+            model_extra = getattr(assistant_message, "model_extra", None) or {}
+            if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
+                raw_reasoning_content = model_extra["reasoning_content"]
+        if isinstance(raw_reasoning_content, str):
+            msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+        elif assistant_tool_calls and self._needs_thinking_reasoning_pad():
+            # DeepSeek V4 Pro and Kimi/Moonshot thinking routes require a
+            # non-empty reasoning_content field on replay. A single space
+            # satisfies the provider validation without fabricating reasoning.
+            msg["reasoning_content"] = reasoning_text or " "
+        elif "reasoning_content" not in msg and reasoning_text:
+            # Streaming-only providers can accumulate reasoning through
+            # delta.reasoning_content without exposing a final top-level
+            # reasoning_content attribute. Persist it in the provider-facing
+            # field so later thinking-model replays have the expected shape.
+            msg["reasoning_content"] = reasoning_text
+
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
             # Anthropic, OpenAI) can maintain reasoning continuity across turns.
@@ -6908,9 +6965,9 @@ class AIAgent:
         if codex_items:
             msg["codex_reasoning_items"] = codex_items
 
-        if assistant_message.tool_calls:
+        if assistant_tool_calls:
             tool_calls = []
-            for tool_call in assistant_message.tool_calls:
+            for tool_call in assistant_tool_calls:
                 raw_id = getattr(tool_call, "id", None)
                 call_id = getattr(tool_call, "call_id", None)
                 if not isinstance(call_id, str) or not call_id.strip():
@@ -6958,6 +7015,63 @@ class AIAgent:
             msg["tool_calls"] = tool_calls
 
         return msg
+
+    def _needs_thinking_reasoning_pad(self) -> bool:
+        """Return True when the active provider enforces reasoning_content echo."""
+        return self._needs_deepseek_tool_reasoning() or self._needs_kimi_tool_reasoning()
+
+    def _needs_kimi_tool_reasoning(self) -> bool:
+        """Return True for Kimi/Moonshot thinking-mode routes."""
+        return (
+            self.provider in {"kimi-coding", "kimi-coding-cn"}
+            or _base_url_host_matches(self.base_url, "api.kimi.com")
+            or _base_url_host_matches(self.base_url, "moonshot.ai")
+            or _base_url_host_matches(self.base_url, "moonshot.cn")
+        )
+
+    def _needs_deepseek_tool_reasoning(self) -> bool:
+        """Return True for DeepSeek thinking-mode routes."""
+        provider = (self.provider or "").lower()
+        model = (self.model or "").lower()
+        return (
+            provider == "deepseek"
+            or "deepseek" in model
+            or _base_url_host_matches(self.base_url, "api.deepseek.com")
+        )
+
+    def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
+        """Copy provider-facing reasoning fields onto an API replay message."""
+        if source_msg.get("role") != "assistant":
+            return
+
+        existing = source_msg.get("reasoning_content")
+        if isinstance(existing, str):
+            api_msg["reasoning_content"] = (
+                " " if existing == "" and self._needs_thinking_reasoning_pad() else existing
+            )
+            return
+
+        needs_thinking_pad = self._needs_thinking_reasoning_pad()
+        normalized_reasoning = source_msg.get("reasoning")
+
+        if (
+            needs_thinking_pad
+            and source_msg.get("tool_calls")
+            and isinstance(normalized_reasoning, str)
+            and normalized_reasoning
+        ):
+            api_msg["reasoning_content"] = " "
+            return
+
+        if isinstance(normalized_reasoning, str) and normalized_reasoning:
+            api_msg["reasoning_content"] = normalized_reasoning
+            return
+
+        if needs_thinking_pad:
+            api_msg["reasoning_content"] = " "
+            return
+
+        api_msg.pop("reasoning_content", None)
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
@@ -7043,9 +7157,7 @@ class AIAgent:
             for msg in messages:
                 api_msg = msg.copy()
                 if msg.get("role") == "assistant":
-                    reasoning = msg.get("reasoning")
-                    if reasoning:
-                        api_msg["reasoning_content"] = reasoning
+                    self._copy_reasoning_content_for_api(msg, api_msg)
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
@@ -7191,6 +7303,19 @@ class AIAgent:
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
 
+        _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
+        _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
+        if _aux_fail_model and not self.quiet_mode:
+            _aux_key = (_aux_fail_model, _aux_fail_err)
+            if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
+                self._last_aux_fallback_warning_key = _aux_key
+                self._vprint(
+                    f"{self.log_prefix}ℹ Configured compression model '{_aux_fail_model}' failed "
+                    f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                    "check auxiliary.compression.model in config.yaml.",
+                    force=True,
+                )
+
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
@@ -7240,9 +7365,10 @@ class AIAgent:
 
         # Update token estimate after compaction so pressure calculations
         # use the post-compression count, not the stale pre-compression one.
-        _compressed_est = (
-            estimate_tokens_rough(new_system_prompt)
-            + estimate_messages_tokens_rough(compressed)
+        _compressed_est = estimate_request_tokens_rough(
+            compressed,
+            system_prompt=new_system_prompt or "",
+            tools=self.tools or None,
         )
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
@@ -7534,7 +7660,11 @@ class AIAgent:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    # ThreadPoolExecutor does not propagate ContextVars by
+                    # default. Snapshot per submitted tool so gateway session
+                    # and approval routing remain isolated under concurrency.
+                    ctx = contextvars.copy_context()
+                    f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete with periodic heartbeats so the
@@ -8650,10 +8780,7 @@ class AIAgent:
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
                 if msg.get("role") == "assistant":
-                    reasoning_text = msg.get("reasoning")
-                    if reasoning_text:
-                        # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
-                        api_msg["reasoning_content"] = reasoning_text
+                    self._copy_reasoning_content_for_api(msg, api_msg)
 
                 # Remove 'reasoning' field - it's for trajectory storage only
                 # We've copied it to 'reasoning_content' for the API above
@@ -10835,7 +10962,10 @@ class AIAgent:
                             + _compressor.last_completion_tokens
                         )
                     else:
-                        _real_tokens = estimate_messages_tokens_rough(messages)
+                        _real_tokens = estimate_request_tokens_rough(
+                            messages,
+                            tools=self.tools or None,
+                        )
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         self._safe_print("  ⟳ compacting context…")

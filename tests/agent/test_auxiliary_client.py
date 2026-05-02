@@ -1623,6 +1623,40 @@ class TestAnthropicCompatImageConversion:
         result = _convert_openai_images_to_anthropic(messages)
         assert result[0] is messages[0]  # same object, not copied
 
+
+class TestAuxiliaryBaseUrlNormalization:
+    def test_kimi_coding_base_url_is_rewritten_for_openai_sdk(self):
+        from agent.auxiliary_client import _to_openai_base_url
+
+        assert (
+            _to_openai_base_url("https://api.kimi.com/coding")
+            == "https://api.kimi.com/coding/v1"
+        )
+
+    def test_kimi_coding_v1_base_url_is_left_unchanged(self):
+        from agent.auxiliary_client import _to_openai_base_url
+
+        assert (
+            _to_openai_base_url("https://api.kimi.com/coding/v1")
+            == "https://api.kimi.com/coding/v1"
+        )
+
+    def test_explicit_custom_kimi_base_url_uses_v1(self):
+        import agent.auxiliary_client as mod
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock(api_key="key", base_url="https://api.kimi.com/coding/v1")
+            client, model = mod.resolve_provider_client(
+                "custom",
+                model="kimi-k2",
+                explicit_base_url="https://api.kimi.com/coding",
+                explicit_api_key="key",
+            )
+
+        assert client is not None
+        assert model == "kimi-k2"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://api.kimi.com/coding/v1"
+
     def test_jpeg_media_type_parsed(self):
         from agent.auxiliary_client import _convert_openai_images_to_anthropic
         messages = [{

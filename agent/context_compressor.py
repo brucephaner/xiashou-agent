@@ -208,6 +208,16 @@ class ContextCompressor(ContextEngine):
         self._previous_summary = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
+
+    def _record_aux_model_failure(self, error: Exception) -> None:
+        """Remember a configured aux-model failure even if main-model retry works."""
+        err_text = str(error).strip() or error.__class__.__name__
+        if len(err_text) > 220:
+            err_text = err_text[:217].rstrip() + "..."
+        self._last_aux_model_failure_error = err_text
+        self._last_aux_model_failure_model = self.summary_model
 
     def update_model(
         self,
@@ -301,6 +311,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
+        self._last_aux_model_failure_error: Optional[str] = None
+        self._last_aux_model_failure_model: Optional[str] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -739,9 +751,25 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     "Falling back to main model '%s' for compression.",
                     self.summary_model, e, self.model,
                 )
+                self._record_aux_model_failure(e)
                 self.summary_model = ""  # empty = use main model
                 self._summary_failure_cooldown_until = 0.0  # no cooldown
-                return self._generate_summary(messages, summary_budget)  # retry immediately
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+
+            if (
+                self.summary_model
+                and self.summary_model != self.model
+                and not getattr(self, "_summary_model_fallen_back", False)
+            ):
+                self._summary_model_fallen_back = True
+                logging.warning(
+                    "Summary model '%s' failed (%s). Retrying on main model '%s'.",
+                    self.summary_model, e, self.model,
+                )
+                self._record_aux_model_failure(e)
+                self.summary_model = ""
+                self._summary_failure_cooldown_until = 0.0
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
             # Transient errors (timeout, rate limit, network) — shorter cooldown
             _transient_cooldown = 60
@@ -1016,6 +1044,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 everything else.  Inspired by Claude Code's ``/compact``.
         """
         n_messages = len(messages)
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self.protect_first_n + 3 + 1
         if n_messages <= _min_for_compress:

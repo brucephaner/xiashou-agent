@@ -1681,6 +1681,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        handed_off_to_drain = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -1695,6 +1696,20 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+
+        def _spawn_drain_task(pending_event: MessageEvent) -> None:
+            nonlocal handed_off_to_drain
+            handed_off_to_drain = True
+            drain_task = asyncio.create_task(
+                self._process_message_background(pending_event, session_key)
+            )
+            try:
+                self._background_tasks.add(drain_task)
+                drain_task.add_done_callback(self._background_tasks.discard)
+                drain_task.add_done_callback(self._expected_cancelled_tasks.discard)
+            except TypeError:
+                # Tests may stub create_task() with a non-hashable sentinel.
+                pass
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
@@ -1907,17 +1922,23 @@ class BasePlatformAdapter(ABC):
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued message from interrupt", self.name)
-                # Clean up current session before processing pending
-                if session_key in self._active_sessions:
-                    del self._active_sessions[session_key]
+                # Keep the session guard live while handing off to the next
+                # queued turn.  Clearing the Event resets the interrupt signal;
+                # deleting the entry would let a concurrent inbound message start
+                # a second handler for this same session.
+                active_event = self._active_sessions.get(session_key)
+                if active_event is not None:
+                    active_event.clear()
                 typing_task.cancel()
                 try:
                     await typing_task
                 except asyncio.CancelledError:
                     pass
-                # Process pending message in new background task
-                await self._process_message_background(pending_event, session_key)
-                return  # Already cleaned up
+                # Spawn a fresh task instead of recursively awaiting the next
+                # turn. Sustained follow-ups can otherwise grow the Python/C
+                # stack until the process crashes.
+                _spawn_drain_task(pending_event)
+                return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
@@ -1967,8 +1988,24 @@ class BasePlatformAdapter(ABC):
                     await self.stop_typing(event.source.chat_id)
             except Exception:
                 pass
+            # A follow-up can arrive during the cleanup awaits above. It sees
+            # the still-live session guard and is queued as pending; drain it
+            # with a fresh task so it is not dropped when this turn unwinds.
+            late_pending = self._pending_messages.pop(session_key, None)
+            if late_pending is not None:
+                if handed_off_to_drain:
+                    # An in-band handoff already created the next owner. Put the
+                    # late arrival back so that fresh task processes it after the
+                    # event it already owns.
+                    self._pending_messages[session_key] = late_pending
+                else:
+                    logger.debug("[%s] Late-arrival pending message during cleanup — spawning drain task", self.name)
+                    active_event = self._active_sessions.get(session_key)
+                    if active_event is not None:
+                        active_event.clear()
+                    _spawn_drain_task(late_pending)
             # Clean up session tracking
-            if session_key in self._active_sessions:
+            if not handed_off_to_drain and session_key in self._active_sessions:
                 del self._active_sessions[session_key]
     
     async def cancel_background_tasks(self) -> None:

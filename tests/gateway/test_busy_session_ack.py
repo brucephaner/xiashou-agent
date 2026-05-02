@@ -70,6 +70,7 @@ def _make_runner():
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
+    runner._is_user_authorized = lambda _source: True
     return runner, _AGENT_PENDING_SENTINEL
 
 
@@ -90,6 +91,47 @@ def _make_adapter(platform_val="telegram"):
 
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_message_is_dropped_before_queue_or_interrupt(self):
+        runner, sentinel = _make_runner()
+        runner._is_user_authorized = lambda _source: False
+        adapter = _make_adapter()
+
+        event = _make_event(text="inject this")
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        assert sk not in adapter._pending_messages
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_internal_message_bypasses_busy_auth_gate(self):
+        runner, sentinel = _make_runner()
+        runner._is_user_authorized = MagicMock(side_effect=AssertionError("auth should not run"))
+        adapter = _make_adapter()
+
+        event = _make_event(text="[system]")
+        event.internal = True
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        assert sk in adapter._pending_messages
+        agent.interrupt.assert_called_once_with("[system]")
+        runner._is_user_authorized.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):

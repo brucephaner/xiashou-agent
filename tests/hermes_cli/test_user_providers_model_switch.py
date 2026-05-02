@@ -278,3 +278,69 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     
     assert result.success is True
     assert result.error_message == ""
+
+
+def test_get_named_custom_provider_reads_transport_field(monkeypatch):
+    """v12+ providers dict stores API mode under transport, not api_mode."""
+    config = {
+        "_config_version": 12,
+        "providers": {
+            "my-codex-provider": {
+                "name": "my-codex-provider",
+                "api": "http://127.0.0.1:4000/v1",
+                "api_key": "test-key",
+                "default_model": "gpt-5",
+                "transport": "codex_responses",
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    result = rp._get_named_custom_provider("my-codex-provider")
+
+    assert result is not None
+    assert result["api_mode"] == "codex_responses"
+    assert result["base_url"] == "http://127.0.0.1:4000/v1"
+    assert result["model"] == "gpt-5"
+
+
+def test_get_named_custom_provider_legacy_api_mode_field_still_works(monkeypatch):
+    config = {
+        "_config_version": 12,
+        "providers": {
+            "anthropic-proxy": {
+                "name": "anthropic-proxy",
+                "api": "http://127.0.0.1:8082",
+                "api_key": "test-key",
+                "default_model": "claude-opus-4-7",
+                "api_mode": "anthropic_messages",
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    result = rp._get_named_custom_provider("anthropic-proxy")
+
+    assert result is not None
+    assert result["api_mode"] == "anthropic_messages"
+
+
+def test_get_named_custom_provider_transport_resolves_via_display_name(monkeypatch):
+    config = {
+        "_config_version": 12,
+        "providers": {
+            "slug-different-from-name": {
+                "name": "Codex Provider",
+                "api": "http://127.0.0.1:4000/v1",
+                "api_key": "test-key",
+                "default_model": "gpt-5",
+                "transport": "codex_responses",
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    result = rp._get_named_custom_provider("Codex Provider")
+
+    assert result is not None
+    assert result["api_mode"] == "codex_responses"

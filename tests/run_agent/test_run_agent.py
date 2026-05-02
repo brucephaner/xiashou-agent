@@ -448,6 +448,61 @@ class TestMaskApiKey:
 
 
 class TestInit:
+    def test_ollama_num_ctx_is_capped_by_model_context_length(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.is_local_endpoint", return_value=True),
+            patch("run_agent.query_ollama_num_ctx", return_value=262144),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {"context_length": 128000},
+                    "compression": {"enabled": False},
+                },
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="http://localhost:11434/v1",
+                model="llama3.3",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert a._ollama_num_ctx == 128000
+
+    def test_explicit_ollama_num_ctx_is_not_capped_by_context_length(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.is_local_endpoint", return_value=True),
+            patch("run_agent.query_ollama_num_ctx", return_value=262144),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "context_length": 128000,
+                        "ollama_num_ctx": 196000,
+                    },
+                    "compression": {"enabled": False},
+                },
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="http://localhost:11434/v1",
+                model="llama3.3",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert a._ollama_num_ctx == 196000
+
     def test_anthropic_base_url_accepted(self):
         """Anthropic base URLs should route to native Anthropic client."""
         with (
@@ -1038,6 +1093,30 @@ class TestBuildAssistantMessage:
         msg = _mock_assistant_msg(content="answer", reasoning="thinking")
         result = agent._build_assistant_message(msg, "stop")
         assert result["reasoning"] == "thinking"
+        assert result["reasoning_content"] == "thinking"
+
+    def test_sdk_reasoning_content_wins_over_reasoning_fallback(self, agent):
+        msg = _mock_assistant_msg(
+            content="answer",
+            reasoning="summary only",
+            reasoning_content="structured provider scratchpad",
+        )
+        result = agent._build_assistant_message(msg, "stop")
+        assert result["reasoning_content"] == "structured provider scratchpad"
+
+    def test_no_reasoning_text_leaves_reasoning_content_absent(self, agent):
+        msg = _mock_assistant_msg(content="plain answer")
+        result = agent._build_assistant_message(msg, "stop")
+        assert "reasoning_content" not in result
+
+    def test_deepseek_tool_call_without_reasoning_gets_space_placeholder(self, agent):
+        agent.provider = "deepseek"
+        agent.model = "deepseek-v4-pro"
+        agent.base_url = "https://api.deepseek.com/v1"
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        result = agent._build_assistant_message(msg, "tool_calls")
+        assert result["reasoning_content"] == " "
 
     def test_with_tool_calls(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
@@ -1077,6 +1156,108 @@ class TestBuildAssistantMessage:
         msg = _mock_assistant_msg(content="", tool_calls=[tc])
         result = agent._build_assistant_message(msg, "tool_calls")
         assert "extra_content" not in result["tool_calls"][0]
+
+
+class TestReasoningContentReplay:
+    def test_deepseek_missing_reasoning_content_gets_space_placeholder(self, agent):
+        agent.provider = "deepseek"
+        agent.model = "deepseek-v4-pro"
+        source = {"role": "assistant", "content": "hello"}
+        api_msg = {}
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["reasoning_content"] == " "
+
+    def test_deepseek_stale_empty_reasoning_content_upgraded_to_space(self, agent):
+        agent.provider = "deepseek"
+        agent.model = "deepseek-v4-pro"
+        source = {"role": "assistant", "content": "", "reasoning_content": ""}
+        api_msg = {}
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["reasoning_content"] == " "
+
+    def test_non_thinking_provider_preserves_empty_reasoning_content(self, agent):
+        agent.provider = "openrouter"
+        agent.model = "anthropic/claude-sonnet-4.6"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        source = {"role": "assistant", "content": "hello", "reasoning_content": ""}
+        api_msg = {}
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["reasoning_content"] == ""
+
+    def test_deepseek_cross_provider_tool_history_does_not_leak_reasoning(self, agent):
+        agent.provider = "deepseek"
+        agent.model = "deepseek-v4-pro"
+        source = {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "prior provider hidden chain",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+        }
+        api_msg = {}
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["reasoning_content"] == " "
+
+    def test_kimi_moonshot_base_url_gets_space_placeholder(self, agent):
+        agent.provider = "custom"
+        agent.model = "kimi-k2"
+        agent.base_url = "https://api.moonshot.ai/v1"
+        source = {"role": "assistant", "content": "hello"}
+        api_msg = {}
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["reasoning_content"] == " "
+
+
+class TestContextEngineToolInjection:
+    def test_context_engine_tool_injection_deduplicates_existing_names(self):
+        tool_defs = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lcm_grep",
+                    "description": "already registered",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        schemas = [
+            {
+                "name": "lcm_grep",
+                "description": "duplicate",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "lcm_expand",
+                "description": "new",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=list(tool_defs)),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.ContextCompressor.get_tool_schemas", return_value=schemas),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        names = [tool["function"]["name"] for tool in a.tools]
+        assert names.count("lcm_grep") == 1
+        assert names.count("lcm_expand") == 1
 
 
 class TestFormatToolsForSystemMessage:

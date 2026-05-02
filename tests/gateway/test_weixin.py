@@ -132,6 +132,13 @@ class TestWeixinCrossProcessDedup:
 
 
 class TestWeixinChunking:
+    def test_default_chunk_limit_matches_ilink_limit(self):
+        adapter = _make_adapter()
+
+        assert adapter.MAX_MESSAGE_LENGTH == 2000
+        assert adapter._send_chunk_delay_seconds == 1.5
+        assert adapter._send_chunk_retries == 4
+
     def test_split_text_splits_short_chatty_replies_into_separate_bubbles(self):
         adapter = _make_adapter()
 
@@ -405,6 +412,18 @@ class TestWeixinChunkDelivery:
         assert send_message_mock.await_count == 3
         assert sleep_mock.await_count == 2
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_splits_long_messages_at_ilink_limit(self, send_message_mock):
+        adapter = self._connected_adapter()
+        content = "x" * 2500
+
+        result = asyncio.run(adapter.send("wxid_test123", content))
+
+        assert result.success is True
+        assert send_message_mock.await_count >= 2
+        sent_texts = [call.kwargs["text"] for call in send_message_mock.await_args_list]
+        assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in sent_texts)
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_send_retries_failed_chunk_before_continuing(self, send_message_mock, sleep_mock):
@@ -469,6 +488,47 @@ class TestWeixinChunkDelivery:
         assert first_call["client_id"] == retry_call["client_id"]
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_treats_ret_minus_two_unknown_error_as_stale_session(self, send_message_mock):
+        adapter = self._connected_adapter()
+        send_message_mock.side_effect = [
+            {"ret": weixin.RATE_LIMIT_ERRCODE, "errcode": 0, "errmsg": "unknown error"},
+            {"ret": 0, "errcode": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        assert send_message_mock.await_args_list[0].kwargs["context_token"] == "ctx-token"
+        assert send_message_mock.await_args_list[1].kwargs["context_token"] is None
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_exhaustion_raises_descriptive_error(self, send_message_mock, sleep_mock):
+        import pytest
+
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 1
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": 0,
+            "errmsg": "frequency control",
+        }
+
+        with pytest.raises(RuntimeError, match="rate limited"):
+            asyncio.run(
+                adapter._send_text_chunk(
+                    chat_id="wxid_test123",
+                    chunk="hello",
+                    context_token="ctx-token",
+                    client_id="client-1",
+                )
+            )
+
+        assert send_message_mock.await_count == 2
+        sleep_mock.assert_awaited_once()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_send_pauses_when_tokenless_retry_still_session_expired(self, send_message_mock):
         adapter = self._connected_adapter()
         adapter._session_pause_seconds = 37
@@ -510,6 +570,15 @@ class TestWeixinSessionGuard:
             weixin._raise_for_business_error(
                 weixin.EP_SEND_MESSAGE,
                 {"ret": 0, "errcode": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "expired"},
+            )
+
+    def test_raise_for_business_error_treats_ret_minus_two_unknown_as_session_expired(self):
+        import pytest
+
+        with pytest.raises(weixin.WeixinSessionExpiredError):
+            weixin._raise_for_business_error(
+                weixin.EP_SEND_MESSAGE,
+                {"ret": weixin.RATE_LIMIT_ERRCODE, "errcode": 0, "errmsg": "unknown error"},
             )
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
@@ -590,6 +659,30 @@ class TestWeixinSessionGuard:
             paused = weixin._get_paused_session(account_id)
             assert paused is not None
             assert sleep_mock.await_args_list[0].args[0] == min(weixin.RETRY_DELAY_SECONDS, 5)
+        finally:
+            weixin._clear_session_pause(account_id)
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._get_updates", new_callable=AsyncMock)
+    def test_poll_loop_pauses_after_ret_minus_two_unknown_error(self, get_updates_mock, sleep_mock):
+        account_id = "acct-poll-stale-ret"
+        adapter = self._connected_adapter(account_id)
+        adapter._session_pause_seconds = 37
+        adapter._running = True
+        weixin._clear_session_pause(account_id)
+
+        async def fake_get_updates(*args, **kwargs):
+            return {"ret": weixin.RATE_LIMIT_ERRCODE, "errcode": 0, "errmsg": "unknown error"}
+
+        async def fake_sleep(seconds):
+            adapter._running = False
+
+        get_updates_mock.side_effect = fake_get_updates
+        sleep_mock.side_effect = fake_sleep
+
+        try:
+            asyncio.run(adapter._poll_loop())
+            assert weixin._get_paused_session(account_id) is not None
         finally:
             weixin._clear_session_pause(account_id)
 

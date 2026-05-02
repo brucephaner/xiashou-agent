@@ -272,6 +272,58 @@ class TestCompressWithClient:
         assert any(c.startswith(SUMMARY_PREFIX) for c in contents)
         assert len(result) < len(msgs)
 
+    def test_aux_model_failure_is_recorded_when_main_retry_succeeds(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary via main"
+        err = Exception("404 model not found")
+        err.status_code = 404
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="broken-aux",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(10)]
+        with patch("agent.context_compressor.call_llm", side_effect=[err, mock_response]):
+            result = c.compress(msgs)
+
+        assert c._last_aux_model_failure_model == "broken-aux"
+        assert c._last_aux_model_failure_error is not None
+        assert "404" in c._last_aux_model_failure_error
+        assert any("summary via main" in (m.get("content") or "") for m in result)
+
+    def test_aux_model_failure_state_clears_on_next_compress(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary via main"
+        err = Exception("400 configured model rejected")
+        err.status_code = 400
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="broken-aux",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(10)]
+        with patch("agent.context_compressor.call_llm", side_effect=[err, mock_response]):
+            c.compress(msgs)
+        assert c._last_aux_model_failure_model == "broken-aux"
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            c.compress(msgs)
+
+        assert c._last_aux_model_failure_model is None
+        assert c._last_aux_model_failure_error is None
+
     def test_summarization_does_not_split_tool_call_pairs(self):
         mock_client = MagicMock()
         mock_response = MagicMock()

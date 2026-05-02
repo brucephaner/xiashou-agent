@@ -330,6 +330,48 @@ class TestRootLevelProviderOverride:
         assert result["model"]["provider"] == "correct-provider"
         assert "provider" not in result  # root key still cleaned up
 
+    def test_normalize_root_context_length_migrates_to_model(self):
+        """Root-level context_length is migrated into the model section."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        config = {
+            "context_length": 128000,
+            "model": {
+                "default": "some-model",
+            },
+        }
+        result = _normalize_root_model_keys(config)
+        assert result["model"]["context_length"] == 128000
+        assert "context_length" not in result
+
+    def test_normalize_root_context_length_does_not_override_existing(self):
+        """Existing model.context_length wins over the root-level fallback."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        config = {
+            "context_length": 256000,
+            "model": {
+                "default": "some-model",
+                "context_length": 128000,
+            },
+        }
+        result = _normalize_root_model_keys(config)
+        assert result["model"]["context_length"] == 128000
+        assert "context_length" not in result
+
+    def test_normalize_root_context_length_with_string_model(self):
+        """Root-level context_length is migrated when model is a string."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        config = {
+            "context_length": 128000,
+            "model": "some-model",
+        }
+        result = _normalize_root_model_keys(config)
+        assert result["model"]["default"] == "some-model"
+        assert result["model"]["context_length"] == 128000
+        assert "context_length" not in result
+
 
 class TestProviderResolution:
     def test_api_key_is_string_or_none(self):

@@ -107,6 +107,8 @@ class TestBaseInterruptSuppression:
         adapter._pending_messages[session_key] = event_b
 
         await adapter._process_message_background(event_a, session_key)
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
 
         # The stale response should NOT have been sent.
         stale_sends = [s for s in adapter.sent if s["content"] == stale_response]

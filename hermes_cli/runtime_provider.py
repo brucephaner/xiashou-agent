@@ -301,12 +301,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 # Found match by provider key
                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                 if base_url:
-                    return {
+                    result = {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
+                    if api_mode:
+                        result["api_mode"] = api_mode
+                    return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
             if display_name:
@@ -315,12 +319,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     # Found match by display name
                     base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                     if base_url:
-                        return {
+                        result = {
                             "name": display_name,
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
                         }
+                        api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
+                        if api_mode:
+                            result["api_mode"] = api_mode
+                        return result
 
     # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
@@ -360,7 +368,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             result["key_env"] = key_env
         if provider_key:
             result["provider_key"] = provider_key
-        api_mode = _parse_api_mode(entry.get("api_mode"))
+        api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
         if api_mode:
             result["api_mode"] = api_mode
         model_name = str(entry.get("model", "") or "").strip()

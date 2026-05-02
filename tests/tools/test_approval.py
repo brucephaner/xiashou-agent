@@ -503,6 +503,35 @@ class TestFullCommandAlwaysShown:
         assert result == "deny"
 
 
+class TestFailClosedUnderPromptToolkit:
+    def test_prompt_toolkit_active_without_callback_denies_fast(self):
+        with mock_patch(
+            "prompt_toolkit.application.current.get_app_or_none",
+            return_value=object(),
+        ), mock_patch("builtins.input") as input_mock:
+            result = prompt_dangerous_approval(
+                "rm -rf /tmp/demo",
+                "recursive delete",
+                timeout_seconds=60,
+            )
+
+        assert result == "deny"
+        input_mock.assert_not_called()
+
+    def test_callback_still_wins_when_prompt_toolkit_active(self):
+        with mock_patch(
+            "prompt_toolkit.application.current.get_app_or_none",
+            return_value=object(),
+        ):
+            result = prompt_dangerous_approval(
+                "rm -rf /tmp/demo",
+                "recursive delete",
+                approval_callback=lambda *args, **kwargs: "once",
+            )
+
+        assert result == "once"
+
+
 class TestForkBombDetection:
     """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
 
@@ -819,5 +848,4 @@ class TestChmodExecuteCombo:
         cmd = "chmod +x script.sh"
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
-
 

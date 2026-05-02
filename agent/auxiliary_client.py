@@ -166,6 +166,10 @@ def _to_openai_base_url(base_url: str) -> str:
         rewritten = url[: -len("/anthropic")] + "/v1"
         logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
         return rewritten
+    if "api.kimi.com" in url.lower() and url.endswith("/coding"):
+        rewritten = url + "/v1"
+        logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
+        return rewritten
     return url
 
 
@@ -981,10 +985,11 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
         return None, None
     model = _read_main_model() or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
+    openai_base = _to_openai_base_url(custom_base) if "api.kimi.com" in custom_base.lower() else custom_base
     if custom_mode == "codex_responses":
-        real_client = OpenAI(api_key=custom_key, base_url=custom_base)
+        real_client = OpenAI(api_key=custom_key, base_url=openai_base)
         return CodexAuxiliaryClient(real_client, model), model
-    return OpenAI(api_key=custom_key, base_url=custom_base), model
+    return OpenAI(api_key=custom_key, base_url=openai_base), model
 
 
 def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
@@ -1472,7 +1477,12 @@ def resolve_provider_client(
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":
         if explicit_base_url:
-            custom_base = explicit_base_url.strip()
+            custom_base_raw = explicit_base_url.strip().rstrip("/")
+            custom_base = (
+                _to_openai_base_url(custom_base_raw)
+                if "api.kimi.com" in custom_base_raw.lower()
+                else custom_base_raw
+            )
             custom_key = (
                 (explicit_api_key or "").strip()
                 or os.getenv("OPENAI_API_KEY", "").strip()
@@ -1517,7 +1527,12 @@ def resolve_provider_client(
         from hermes_cli.runtime_provider import _get_named_custom_provider
         custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
-            custom_base = custom_entry.get("base_url", "").strip()
+            custom_base_raw = custom_entry.get("base_url", "").strip().rstrip("/")
+            custom_base = (
+                _to_openai_base_url(custom_base_raw)
+                if "api.kimi.com" in custom_base_raw.lower()
+                else custom_base_raw
+            )
             custom_key = custom_entry.get("api_key", "").strip()
             custom_key_env = custom_entry.get("key_env", "").strip()
             if not custom_key and custom_key_env:

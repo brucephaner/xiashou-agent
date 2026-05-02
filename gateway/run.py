@@ -1609,6 +1609,18 @@ class GatewayRunner:
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Match the cold path authorization gate before queuing or interrupting.
+        if not getattr(event, "internal", False) and not self._is_user_authorized(event.source):
+            logger.warning(
+                "Dropping message from unauthorized user in active session: "
+                "user=%s (%s), platform=%s, session=%s",
+                event.source.user_id,
+                event.source.user_name,
+                event.source.platform.value if event.source.platform else "unknown",
+                session_key,
+            )
+            return True
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self.adapters.get(event.source.platform)
@@ -1807,6 +1819,11 @@ class GatewayRunner:
         try:
             if hasattr(agent, "close"):
                 agent.close()
+        except Exception:
+            pass
+        try:
+            from agent.auxiliary_client import cleanup_stale_async_clients
+            cleanup_stale_async_clients()
         except Exception:
             pass
 
@@ -2759,6 +2776,11 @@ class GatewayRunner:
                 cleanup_all_browsers()
             except Exception:
                 pass
+            try:
+                from agent.auxiliary_client import shutdown_cached_clients
+                shutdown_cached_clients()
+            except Exception as _e:
+                logger.debug("shutdown_cached_clients error: %s", _e)
 
             from gateway.status import remove_pid_file
             remove_pid_file()
@@ -4267,6 +4289,28 @@ class GatewayRunner:
                                             "compression",
                                             f"{_new_tokens:,}",
                                         )
+                                    _comp = getattr(_hyg_agent, "context_compressor", None)
+                                    _aux_fail_model = getattr(_comp, "_last_aux_model_failure_model", None)
+                                    if _aux_fail_model:
+                                        _aux_fail_err = (
+                                            getattr(_comp, "_last_aux_model_failure_error", None)
+                                            or "unknown error"
+                                        )
+                                        _aux_msg = (
+                                            f"ℹ️ Configured compression model `{_aux_fail_model}` "
+                                            f"failed ({_aux_fail_err}). Recovered using your main "
+                                            "model; context is intact. Check "
+                                            "`auxiliary.compression.model` in config.yaml."
+                                        )
+                                        try:
+                                            _adapter = self.adapters.get(source.platform)
+                                            if _adapter and source.chat_id:
+                                                await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
+                                        except Exception as _werr:
+                                            logger.warning(
+                                                "Failed to deliver aux-model fallback notice: %s",
+                                                _werr,
+                                            )
                                 finally:
                                     self._cleanup_agent_resources(_hyg_agent)
 
@@ -4527,15 +4571,42 @@ class GatewayRunner:
             # intermediate reasoning) so sessions can be resumed with full context
             # and transcripts are useful for debugging and training data.
             #
-            # IMPORTANT: When the agent failed (e.g. context-overflow 400,
-            # compression exhausted), do NOT persist the user's message.
-            # Persisting it would make the session even larger, causing the
-            # same failure on the next attempt — an infinite loop. (#1630, #9893)
+            # IMPORTANT: For context-overflow failures (compression exhausted,
+            # generic 400 on large sessions) we must NOT persist the user's
+            # message. Persisting it would make the session even larger, causing
+            # the same failure on the next attempt — an infinite loop. (#1630,
+            # #9893)
+            #
+            # Transient failures (429, timeouts, connection errors, provider 5xx)
+            # are different: the session is not oversized, and silently dropping
+            # the user message causes context loss on retry. Persist the user
+            # turn so the conversation is preserved. (#7100)
             agent_failed_early = bool(agent_result.get("failed"))
-            if agent_failed_early:
+            _err_str_for_classify = str(agent_result.get("error", "")).lower()
+            # Use specific multi-word phrases to avoid false positives on
+            # transient errors like "rate limit exceeded" or "invalid auth
+            # token".
+            is_context_overflow_failure = agent_failed_early and (
+                bool(agent_result.get("compression_exhausted"))
+                or any(p in _err_str_for_classify for p in (
+                    "context length", "context size", "context window",
+                    "maximum context", "token limit", "too many tokens",
+                    "reduce the length", "exceeds the limit",
+                    "request entity too large", "prompt is too long",
+                    "payload too large", "input is too long",
+                ))
+                or ("400" in _err_str_for_classify and len(history) > 50)
+            )
+            if is_context_overflow_failure:
                 logger.info(
-                    "Skipping transcript persistence for failed request in "
-                    "session %s to prevent session growth loop.",
+                    "Skipping transcript persistence for context-overflow "
+                    "failure in session %s to prevent session growth loop.",
+                    session_entry.session_id,
+                )
+            elif agent_failed_early:
+                logger.info(
+                    "Transient agent failure in session %s — persisting user "
+                    "message so conversation context is preserved on retry.",
                     session_entry.session_id,
                 )
 
@@ -4562,7 +4633,7 @@ class GatewayRunner:
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if agent_failed_early:
+            if is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -4581,7 +4652,17 @@ class GatewayRunner:
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if not agent_failed_early:
+            if is_context_overflow_failure:
+                pass  # handled above — skip all transcript writes
+            elif agent_failed_early:
+                # Transient failure (429/timeout/5xx): persist only the user
+                # message. The assistant text is gateway-generated error
+                # handling, not model output.
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {"role": "user", "content": message_text, "timestamp": ts},
+                )
+            else:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 
@@ -7097,7 +7178,7 @@ class GatewayRunner:
         try:
             from run_agent import AIAgent
             from agent.manual_compression_feedback import summarize_manual_compression
-            from agent.model_metadata import estimate_messages_tokens_rough
+            from agent.model_metadata import estimate_request_tokens_rough
 
             session_key = self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -7113,7 +7194,6 @@ class GatewayRunner:
                 if m.get("role") in ("user", "assistant") and m.get("content")
             ]
             original_count = len(msgs)
-            approx_tokens = estimate_messages_tokens_rough(msgs)
 
             tmp_agent = AIAgent(
                 **runtime_kwargs,
@@ -7126,6 +7206,13 @@ class GatewayRunner:
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
+                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
+                _tools = getattr(tmp_agent, "tools", None) or None
+                approx_tokens = estimate_request_tokens_rough(
+                    msgs,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                )
 
                 compressor = tmp_agent.context_compressor
                 compress_start = compressor.protect_first_n
@@ -7154,13 +7241,19 @@ class GatewayRunner:
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
-                new_tokens = estimate_messages_tokens_rough(compressed)
+                new_tokens = estimate_request_tokens_rough(
+                    compressed,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                )
                 summary = summarize_manual_compression(
                     msgs,
                     compressed,
                     approx_tokens,
                     new_tokens,
                 )
+                _aux_fail_model = getattr(compressor, "_last_aux_model_failure_model", None)
+                _aux_fail_err = getattr(compressor, "_last_aux_model_failure_error", None)
             finally:
                 self._cleanup_agent_resources(tmp_agent)
             lines = [f"🗜️ {summary['headline']}"]
@@ -7169,6 +7262,13 @@ class GatewayRunner:
             lines.append(summary["token_line"])
             if summary["note"]:
                 lines.append(summary["note"])
+            if _aux_fail_model:
+                lines.append(
+                    f"ℹ️ Configured compression model `{_aux_fail_model}` failed "
+                    f"({_aux_fail_err or 'unknown error'}). Recovered using your main "
+                    "model; context is intact. Check `auxiliary.compression.model` "
+                    "in config.yaml."
+                )
             return "\n".join(lines)
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)

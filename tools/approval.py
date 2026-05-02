@@ -440,6 +440,20 @@ def prompt_dangerous_approval(command: str, description: str,
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"
 
+    try:
+        from prompt_toolkit.application.current import get_app_or_none
+        if get_app_or_none() is not None:
+            logger.warning(
+                "Dangerous-command approval requested without an approval "
+                "callback while prompt_toolkit is active; denying to avoid "
+                "stdin deadlock. command=%r description=%r",
+                command,
+                description,
+            )
+            return "deny"
+    except Exception:
+        pass
+
     os.environ["HERMES_SPINNER_PAUSE"] = "1"
     try:
         while True:
