@@ -326,6 +326,26 @@ class TestMinimaxPreserveDots:
         from run_agent import AIAgent
         assert AIAgent._anthropic_preserve_dots(agent) is True
 
+    def test_zhipu_colon_model_preserves_dots_on_custom_endpoint(self):
+        from types import SimpleNamespace
+        agent = SimpleNamespace(
+            provider="wokey.ai",
+            base_url="https://api.wokey.ai/messages",
+            model="zhipu:glm-5.1",
+        )
+        from run_agent import AIAgent
+        assert AIAgent._anthropic_preserve_dots(agent) is True
+
+    def test_bare_glm_model_preserves_dots_on_custom_endpoint(self):
+        from types import SimpleNamespace
+        agent = SimpleNamespace(
+            provider="wokey.ai",
+            base_url="https://api.wokey.ai/messages",
+            model="glm-5.1",
+        )
+        from run_agent import AIAgent
+        assert AIAgent._anthropic_preserve_dots(agent) is True
+
     def test_bigmodel_cn_url_preserves_dots(self):
         from types import SimpleNamespace
         agent = SimpleNamespace(provider="custom", base_url="https://open.bigmodel.cn/api/paas/v4")

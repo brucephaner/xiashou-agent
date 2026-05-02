@@ -205,6 +205,48 @@ def _detect_claude_code_version() -> str:
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp_"
 
+_DOT_PRESERVING_PROVIDER_PREFIXES = frozenset({
+    "zhipu",
+    "zai",
+    "z-ai",
+    "z.ai",
+    "glm",
+    "qwen",
+    "moonshot",
+    "moonshotai",
+    "kimi",
+    "minimax",
+    "google",
+    "gemini",
+    "openai",
+    "xiaomi",
+    "mimo",
+    "deepseek",
+    "arcee",
+    "arcee-ai",
+})
+
+
+def model_id_has_dot_preserving_provider_prefix(model: str) -> bool:
+    """Return True for non-Anthropic provider-prefixed model IDs.
+
+    Anthropic's native Claude IDs use hyphens for version separators, but
+    Anthropic-compatible gateways can route model IDs such as
+    ``zhipu:glm-5.1`` or ``z-ai/glm-5.1``.  Those prefixes are part of the
+    provider's routing key, so dot-to-hyphen conversion would corrupt the
+    requested model.
+    """
+    value = (model or "").strip().lower()
+    if not value:
+        return False
+
+    for separator in (":", "/"):
+        if separator in value:
+            prefix, suffix = value.split(separator, 1)
+            if prefix.strip() in _DOT_PRESERVING_PROVIDER_PREFIXES and suffix.strip():
+                return True
+    return False
+
 
 def _get_claude_code_version() -> str:
     """Lazily detect the installed Claude Code version when OAuth headers need it."""
@@ -830,12 +872,13 @@ def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     - Strips 'anthropic/' prefix (OpenRouter format, case-insensitive)
     - Converts dots to hyphens in version numbers (OpenRouter uses dots,
       Anthropic uses hyphens: claude-opus-4.6 → claude-opus-4-6), unless
-      preserve_dots is True (e.g. for Alibaba/DashScope: qwen3.5-plus).
+      preserve_dots is True or the model has a non-Anthropic provider prefix
+      (e.g. zhipu:glm-5.1).
     """
     lower = model.lower()
     if lower.startswith("anthropic/"):
         model = model[len("anthropic/"):]
-    if not preserve_dots:
+    if not preserve_dots and not model_id_has_dot_preserving_provider_prefix(model):
         # OpenRouter uses dots for version separators (claude-opus-4.6),
         # Anthropic uses hyphens (claude-opus-4-6). Convert dots to hyphens.
         model = model.replace(".", "-")

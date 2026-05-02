@@ -481,6 +481,10 @@ class TestNormalizeModelName:
         assert normalize_model_name("anthropic/qwen3.5-plus", preserve_dots=True) == "qwen3.5-plus"
         assert normalize_model_name("qwen3.5-flash", preserve_dots=True) == "qwen3.5-flash"
 
+    def test_preserves_non_anthropic_provider_prefixed_model(self):
+        assert normalize_model_name("zhipu:glm-5.1") == "zhipu:glm-5.1"
+        assert normalize_model_name("z-ai/glm-5.1") == "z-ai/glm-5.1"
+
 
 # ---------------------------------------------------------------------------
 # Tool conversion

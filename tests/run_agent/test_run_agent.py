@@ -159,6 +159,28 @@ class TestProviderModelNormalization:
 
         assert agent.model == "glm-5.1"
 
+    def test_anthropic_messages_preserves_zhipu_colon_model(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            agent = AIAgent(
+                model="zhipu:glm-5.1",
+                provider="wokey.ai",
+                base_url="https://api.wokey.ai/messages",
+                api_key="test-key-1234567890",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "ping"}])
+        assert kwargs["model"] == "zhipu:glm-5.1"
+
     def test_aiagent_keeps_aggregator_vendor_slug(self):
         with (
             patch(

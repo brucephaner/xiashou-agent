@@ -6424,7 +6424,38 @@ class AIAgent:
         MiniMax keeps dots (e.g. MiniMax-M2.7).
         OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
         ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1)."""
-        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go", "opencode-zen", "zai"}:
+        provider = (getattr(self, "provider", "") or "").lower()
+        if provider in {
+            "alibaba",
+            "minimax",
+            "minimax-cn",
+            "opencode-go",
+            "opencode-zen",
+            "zai",
+            "zhipu",
+            "z-ai",
+            "z.ai",
+            "glm",
+        }:
+            return True
+        try:
+            from agent.anthropic_adapter import model_id_has_dot_preserving_provider_prefix
+
+            if model_id_has_dot_preserving_provider_prefix(getattr(self, "model", "") or ""):
+                return True
+        except Exception:
+            pass
+        model = (getattr(self, "model", "") or "").lower()
+        if model.startswith((
+            "glm-",
+            "qwen",
+            "kimi-",
+            "minimax",
+            "gemini-",
+            "gpt-",
+            "mimo-",
+            "deepseek-",
+        )):
             return True
         base = (getattr(self, "base_url", "") or "").lower()
         return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/" in base or "bigmodel.cn" in base
