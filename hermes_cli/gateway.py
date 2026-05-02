@@ -895,8 +895,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -910,8 +909,10 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"{host_env_block}
-Restart=on-failure
-RestartSec=30
+Restart=always
+RestartSec=60
+RestartMaxDelaySec=300
+RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
@@ -933,9 +934,9 @@ WantedBy=multi-user.target
     host_env_block = f"\n{host_env}" if host_env else ""
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
-After=network.target
-StartLimitIntervalSec=600
-StartLimitBurst=5
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -944,8 +945,10 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"{host_env_block}
-Restart=on-failure
-RestartSec=30
+Restart=always
+RestartSec=60
+RestartMaxDelaySec=300
+RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
@@ -1176,7 +1179,7 @@ def systemd_restart(system: bool = False):
     pid = get_running_pid()
     if pid is not None and _request_gateway_self_restart(pid):
         # SIGUSR1 sent — the gateway will drain active agents, exit with
-        # code 75, and systemd will restart it after RestartSec (30s).
+        # code 75, and systemd will restart it after RestartSec (60s).
         # Wait for the old process to die and the new one to become active
         # so the CLI doesn't return while the service is still restarting.
         import time
@@ -1675,7 +1678,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     print()
     
     # Exit with code 1 if gateway fails to connect any platform,
-    # so systemd Restart=on-failure will retry on transient errors
+    # so systemd Restart=always will retry on transient errors
     verbosity = None if quiet else verbose
     success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
     if not success:
